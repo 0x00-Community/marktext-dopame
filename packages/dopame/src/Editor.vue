@@ -130,7 +130,7 @@ onMounted(() => {
     spellcheckEnabled: false, disableHtml: true, autoPairMarkdownSyntax: true })
   muya.locale(zhCN)
   muya.init({ focus: false })
-  detachSelection = attachNativeSelection(muya.domNode)
+  detachSelection = attachNativeSelection(muya)
   muya.domNode.setAttribute('aria-label', 'Markdown 编辑器')
   source = CodeMirror(sourceHost.value!, { value: sourceText, mode: 'gfm', lineNumbers: true,
     lineWrapping: true, tabSize: 2, indentUnit: 2, inputStyle: 'textarea',
