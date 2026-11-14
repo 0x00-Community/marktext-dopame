@@ -7,8 +7,7 @@ import CodeMirror from 'codemirror'
 import 'codemirror/lib/codemirror.css'
 import 'codemirror/mode/gfm/gfm'
 import 'codemirror/addon/search/searchcursor'
-import { editorText, outline } from './document'
-import { attachNativeSelection } from './nativeSelection'
+import { editorText } from './document'
 
 const props = defineProps<{ text: string; mode: 'edit' | 'source' | 'read'; active: boolean }>()
 const emit = defineEmits<{ change: [text: string]; outline: [items: { lvl: number; content: string; slug: string }[]] }>()
@@ -20,7 +19,6 @@ let syncing = false
 let richText = ''
 let sourceText = ''
 let searchText = ''
-let detachSelection: (() => void) | undefined
 
 for (const plugin of [InlineFormatToolbar, ParagraphFrontButton, ParagraphFrontMenu,
   ParagraphQuickInsertMenu, TableChessboard, TableColumnToolbar, TableDragBar,
@@ -54,7 +52,6 @@ async function syncMode() {
       richText = text
     }
     muya.setReadOnly(props.mode === 'read')
-    muya.domNode.setAttribute('aria-label', props.mode === 'read' ? 'Markdown 阅读预览' : 'Markdown 编辑器')
     emit('outline', muya.getTOC())
   }
   syncing = false
@@ -111,10 +108,8 @@ function replace(text: string, all: boolean) {
 
 function reveal(slug: string, index: number) {
   if (props.mode === 'source') {
-    const heading = outline(source.getValue())[index]
-    if (!heading) return
-    source.focus()
-    source.setCursor({ line: heading.line, ch: 0 })
+    const headings = source.getValue().split('\n').flatMap((line, i) => /^#{1,6}\s/.test(line) ? [i] : [])
+    source.setCursor({ line: headings[index] ?? 0, ch: 0 })
     source.scrollIntoView(source.getCursor(), 80)
   } else {
     const heading = Array.from(richHost.value!.querySelectorAll('[id]')).find(node => node.id === slug)
@@ -130,7 +125,6 @@ onMounted(() => {
     spellcheckEnabled: false, disableHtml: true, autoPairMarkdownSyntax: true })
   muya.locale(zhCN)
   muya.init({ focus: false })
-  detachSelection = attachNativeSelection(muya)
   muya.domNode.setAttribute('aria-label', 'Markdown 编辑器')
   source = CodeMirror(sourceHost.value!, { value: sourceText, mode: 'gfm', lineNumbers: true,
     lineWrapping: true, tabSize: 2, indentUnit: 2, inputStyle: 'textarea',
@@ -147,7 +141,7 @@ watch(() => props.active, async active => {
   await nextTick()
   if (props.mode === 'source') source.refresh()
 })
-onBeforeUnmount(() => { detachSelection?.(); muya?.destroy() })
+onBeforeUnmount(() => { muya?.destroy() })
 defineExpose({ flush, undo, redo, find, replace, reveal })
 </script>
 

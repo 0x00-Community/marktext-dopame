@@ -36,21 +36,6 @@ export async function readResource(resource: Resource): Promise<OpenedFile> {
   }
 }
 
-export async function createNote(root: string, path: string): Promise<OpenedFile> {
-  await fs.writeFile(root, path, '', { create: 'new' })
-  return readResource({ kind: 'root', root, path })
-}
-
-export async function requireAvailablePath(root: string, path: string) {
-  try {
-    await fs.stat(root, path)
-  } catch (error) {
-    if ((error as { code?: string }).code === 'ENOENT') return
-    throw error
-  }
-  throw new Error('此名称已存在，请换一个名称。')
-}
-
 export async function openFiles(): Promise<OpenedFile[]> {
   const handles = await pickers.showOpenFilePicker({ multiple: true })
   return Promise.all(handles.map(readHandle))
@@ -63,16 +48,11 @@ export async function saveResource(resource: Resource, text: string): Promise<Re
         code: 'ECONFLICT'
       })
     }
-    await fs.writeFile(resource.root, resource.path, text, {
+    const file = await fs.writeFile(resource.root, resource.path, text, {
       ifVersion: resource.version,
       create: 'never'
     })
-    // acdert 0.0.9 write entries omit version; obtain it from the committed snapshot.
-    const saved = await readResource(resource)
-    if (saved.text !== text) {
-      throw Object.assign(new Error('保存后文件再次发生变化，当前编辑已保留。'), { code: 'ECONFLICT' })
-    }
-    return saved.resource
+    return { ...resource, version: file.version }
   }
 
   // Handles have no CAS: metadata checks cannot prevent changes during the write.
