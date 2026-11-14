@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Contenteditable probe</title>
+<style>body{font:20px sans-serif;padding:32px} [contenteditable],textarea{display:block;border:1px solid;padding:16px;min-height:50px;margin:16px 0;width:500px}</style></head>
+<body><h1>Native input probe</h1>
+<div id="plain" role="textbox" aria-label="Plain editable" contenteditable="true">plain text</div>
+<div id="empty" role="textbox" aria-label="Empty editable" contenteditable="true"><br></div>
+<textarea id="control" aria-label="Textarea control">plain text</textarea>
+<script>
+window.inputEvents = []
+for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click', 'keydown', 'beforeinput', 'input', 'selectionchange']) {
+  document.addEventListener(type, event => inputEvents.push({type, target: event.target.id, key: event.key, data: event.data, trusted: event.isTrusted, ranges: getSelection().rangeCount}), true)
+}
+</script></body></html>

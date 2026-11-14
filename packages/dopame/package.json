@@ -8,7 +8,8 @@
     "dev": "acde dev",
     "check": "acde check",
     "build": "acde build",
-    "typecheck": "vue-tsc --noEmit",
+    "typecheck": "tsc -p ../muya/tsconfig.build.json && vue-tsc --noEmit",
+    "test:e2e": "acde test",
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {

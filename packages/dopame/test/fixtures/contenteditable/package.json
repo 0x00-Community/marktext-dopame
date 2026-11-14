@@ -1,0 +1,20 @@
+{
+  "name": "contenteditable-probe",
+  "private": true,
+  "acde": {
+    "apiLevel": 1,
+    "apps": [
+      {
+        "id": "contenteditable-probe",
+        "label": "Contenteditable probe",
+        "icon": "editor",
+        "entry": "/app/contenteditable-probe/index.html"
+      }
+    ],
+    "assets": {
+      "/app/contenteditable-probe/": [
+        "web"
+      ]
+    }
+  }
+}
