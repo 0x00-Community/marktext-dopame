@@ -1,0 +1,73 @@
+import { mkdir, readFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { test, expect } from 'acde/test'
+
+test('current folder supports create, rename, save and delete', async({ app }) => {
+  const window = app!
+  await window.getByRole('button', { name: '新建文件夹', exact: true }).click()
+  await window.getByRole('textbox', { name: '文件夹名称' }).fill('测试目录')
+  await window.getByRole('button', { name: '创建', exact: true }).click()
+  await window.getByRole('button', { name: /^▸\s*测试目录$/ }).click()
+  await window.getByRole('button', { name: '新建笔记', exact: true }).click()
+  await window.getByRole('textbox', { name: '名称', exact: true }).fill('草稿.md')
+  await window.getByRole('button', { name: '创建', exact: true }).click()
+  await expect(window.getByRole('button', { name: /← 测试目录/ })).toBeVisible()
+  await window.getByRole('button', { name: '重命名 草稿.md', exact: true }).click()
+  await window.getByRole('textbox', { name: '名称', exact: true }).fill('完成.md')
+  await window.getByRole('button', { name: '重命名', exact: true }).click()
+  await expect(window.getByRole('tab', { name: '完成.md', exact: true })).toBeVisible()
+  await window.getByRole('button', { name: '源码', exact: true }).click()
+  await window.getByRole('textbox', { name: 'Markdown 源码' }).press('ctrl+a')
+  await window.keyboard.insertText('# 保存在当前目录')
+  await window.getByRole('button', { name: '保存', exact: true }).click()
+  await expect.poll(() => window.evaluate(`import('acde:fs').then(({fs}) => fs.readText('private', '测试目录/完成.md')).then(file => file.text)`)).toBe('# 保存在当前目录')
+  await window.getByRole('button', { name: /← 测试目录/ }).click()
+  await window.getByRole('button', { name: '重命名 测试目录', exact: true }).click()
+  await window.getByRole('textbox', { name: '名称', exact: true }).fill('改名目录')
+  await window.getByRole('button', { name: '重命名', exact: true }).click()
+  await window.getByRole('button', { name: /^▸\s*改名目录$/ }).click()
+  await window.getByRole('textbox', { name: 'Markdown 源码' }).press('ctrl+a')
+  await window.keyboard.insertText('# 目录改名后继续保存')
+  await window.getByRole('button', { name: '保存', exact: true }).click()
+  await expect.poll(() => window.evaluate(`import('acde:fs').then(({fs}) => fs.readText('private', '改名目录/完成.md')).then(file => file.text)`)).toBe('# 目录改名后继续保存')
+  await window.getByRole('button', { name: '删除 完成.md', exact: true }).click()
+  await window.getByRole('button', { name: '永久删除', exact: true }).click()
+  await expect(window.getByRole('tab', { name: '完成.md', exact: true })).toHaveCount(0)
+  await expect.poll(() => window.evaluate(`import('acde:fs').then(({fs}) => fs.list('private', '改名目录')).then(result => result.entries.length)`)).toBe(0)
+})
+
+test('file operations preserve unsaved text and existing targets', async({ app }) => {
+  const window = app!
+  await window.getByRole('button', { name: '新建笔记', exact: true }).click()
+  await window.getByRole('textbox', { name: '名称', exact: true }).fill('保留.md')
+  await window.getByRole('button', { name: '创建', exact: true }).click()
+  await window.getByRole('button', { name: '源码', exact: true }).click()
+  await window.getByRole('textbox', { name: 'Markdown 源码' }).press('ctrl+a')
+  await window.keyboard.insertText('不能丢失的正文')
+  await window.getByRole('button', { name: '删除 保留.md', exact: true }).click()
+  await window.getByRole('button', { name: '永久删除', exact: true }).click()
+  await expect(window.getByRole('alert')).toContainText('未保存修改')
+  await window.getByRole('button', { name: '取消', exact: true }).click()
+  await window.getByRole('button', { name: '保存', exact: true }).click()
+  await window.getByRole('button', { name: '新建笔记', exact: true }).click()
+  await window.getByRole('textbox', { name: '名称', exact: true }).fill('保留.md')
+  await window.getByRole('button', { name: '创建', exact: true }).click()
+  await expect(window.getByRole('alert')).toBeVisible()
+  await expect.poll(() => window.evaluate("import('acde:fs').then(({fs}) => fs.readText('private', '保留.md')).then(file => file.text)")).toBe('不能丢失的正文')
+})
+
+
+test('picked folder becomes the active location for new notes', async({ app, acde, home }) => {
+  const window = app!
+  const folder = join(home, 'picked-project')
+  await mkdir(folder)
+  await acde.chooseFolder(folder)
+  await window.getByRole('button', { name: '添加文件夹', exact: true }).click()
+  await window.getByRole('button', { name: '新建笔记', exact: true }).click()
+  await window.getByRole('textbox', { name: '名称', exact: true }).fill('外部笔记.md')
+  await window.getByRole('button', { name: '创建', exact: true }).click()
+  await expect(window.getByRole('tab', { name: '外部笔记.md', exact: true })).toBeVisible()
+  expect(await readFile(join(folder, '外部笔记.md'), 'utf8')).toBe('')
+  expect((await acde.console()).entries.filter(entry => entry.level === 'error')).toHaveLength(0)
+  expect((await acde.network({ failed: true })).entries).toHaveLength(0)
+})

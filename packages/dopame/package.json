@@ -1,0 +1,28 @@
+{
+  "name": "marktext-dopame",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "dev": "acde dev",
+    "check": "acde check",
+    "build": "acde build",
+    "typecheck": "tsc -p ../muya/tsconfig.build.json && vue-tsc --noEmit",
+    "test:e2e": "acde test",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@muyajs/core": "workspace:*",
+    "vue": "^3.5.43",
+    "codemirror": "^5.65.21"
+  },
+  "devDependencies": {
+    "@dopame/acde-api": "https://calbin-1318886512.cos.ap-beijing.myqcloud.com/pkgs/acdert/0.0.9/acde-api-0.0.9.tar.gz",
+    "@vitejs/plugin-vue": "^6.0.9",
+    "@types/codemirror": "^5.60.18",
+    "typescript": "^6.0.3",
+    "vite": "^8.3.4",
+    "vue-tsc": "3.3.11"
+  }
+}

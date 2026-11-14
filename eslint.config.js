@@ -17,6 +17,7 @@ export default [
       '.claude/**',
       '**/out/**',
       '**/dist/**',
+      '**/.acde/**',
       // Keep Next.js rules out of desktop CI; the website validates its own React code.
       'packages/website/**',
       // muya v2 (TS) self-lints with its own antfu-based config
