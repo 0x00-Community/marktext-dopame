@@ -28,6 +28,7 @@ class InlineEngine {
             const selected = muya.editor.selection?.image;
             return {
                 root: muya.domNode,
+                loadImage: muya.options.loadImage,
                 readOnly: muya.isReadOnly,
                 softNewlineAsSpace: muya.options.softNewlineAsSpace,
                 references: this.labels,

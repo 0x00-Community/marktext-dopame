@@ -127,3 +127,13 @@ it('automatically removes pending subscriptions when the document is rebuilt', a
         muya.destroy();
     }
 });
+
+it('resolves host image URLs without changing resource identity', async () => {
+    const resources = new ImageResources();
+    const resolveSrc = vi.fn(async () => ({ url: 'data:image/png;base64,aGVsbG8=', width: 1, height: 1 }));
+    vi.mocked(loadImage).mockResolvedValue({ url: 'data:image/png;base64,aGVsbG8=', width: 1, height: 1 });
+    const result = await resources.request('relative.png', false, resolveSrc);
+    expect(resolveSrc).toHaveBeenCalledWith('relative.png');
+    expect(loadImage).not.toHaveBeenCalled();
+    expect(resources.get('relative.png')).toBe(result);
+});

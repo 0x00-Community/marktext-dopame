@@ -7,10 +7,12 @@ import CodeMirror from 'codemirror'
 import 'codemirror/lib/codemirror.css'
 import 'codemirror/mode/gfm/gfm'
 import 'codemirror/addon/search/searchcursor'
+import { shortcutHint } from './shortcuts'
 import { editorText, outline } from './document'
+import { loadDocumentImage, type Resource } from './files'
 import { attachNativeSelection } from './nativeSelection'
 
-const props = defineProps<{ text: string; mode: 'edit' | 'source' | 'read'; active: boolean }>()
+const props = defineProps<{ text: string; resource: Resource | null; mode: 'edit' | 'source' | 'read'; active: boolean }>()
 const emit = defineEmits<{ change: [text: string]; outline: [items: { lvl: number; content: string; slug: string }[]] }>()
 const richHost = ref<HTMLElement>()
 const sourceHost = ref<HTMLElement>()
@@ -25,7 +27,7 @@ let detachSelection: (() => void) | undefined
 for (const plugin of [InlineFormatToolbar, ParagraphFrontButton, ParagraphFrontMenu,
   ParagraphQuickInsertMenu, TableChessboard, TableColumnToolbar, TableDragBar,
   TableRowColumMenu, CodeBlockLanguageSelector, LinkTools]) {
-  if (!Muya.plugins.some(item => item.plugin === plugin)) Muya.use(plugin)
+  if (!Muya.plugins.some(item => item.plugin === plugin)) Muya.use(plugin, { keyboardShortcuts: false, getShortcut: shortcutHint })
 }
 
 function publish() {
@@ -59,7 +61,7 @@ async function syncMode() {
   }
   syncing = false
   await nextTick()
-  if (props.mode === 'source') source.refresh()
+  if (props.mode === 'source') { source.refresh(); if (props.active) source.focus() }
 }
 
 function flush() {
@@ -67,13 +69,26 @@ function flush() {
 }
 
 function undo() {
-  if (props.mode === 'source') source.undo()
-  else if (props.mode === 'edit') muya.undo()
+  if (props.mode === 'source') { source.undo(); source.focus() }
+  else if (props.mode === 'edit') { muya.flush(); muya.undo(); muya.focus() }
 }
 
 function redo() {
-  if (props.mode === 'source') source.redo()
-  else if (props.mode === 'edit') muya.redo()
+  if (props.mode === 'source') { source.redo(); source.focus() }
+  else if (props.mode === 'edit') { muya.redo(); muya.focus() }
+}
+
+function command(action: string) {
+  if (props.mode !== 'edit') return
+  muya.flush()
+  if (action.startsWith('format:')) muya.format(action.slice(7))
+  else if (action.startsWith('paragraph:')) muya.updateParagraph(action.slice(10))
+  muya.focus()
+  const selection = muya.getSelectionState()
+  const node = document.getSelection()?.focusNode
+  const element = node?.nodeType === Node.ELEMENT_NODE ? node as Element : node?.parentElement
+  element?.closest<HTMLElement>('[contenteditable="true"]')?.focus({ preventScroll: true })
+  if (selection) muya.setSelection(selection)
 }
 
 function find(text: string, backwards = false) {
@@ -127,6 +142,7 @@ onMounted(() => {
   const container = document.createElement('div')
   richHost.value!.appendChild(container)
   muya = new Muya(container, { markdown: richText, fontSize: 17, lineHeight: 1.75,
+    loadImage: src => loadDocumentImage(props.resource, src),
     spellcheckEnabled: false, disableHtml: true, autoPairMarkdownSyntax: true })
   muya.locale(zhCN)
   muya.init({ focus: false })
@@ -142,13 +158,14 @@ onMounted(() => {
   void syncMode()
 })
 watch(() => props.mode, syncMode)
+watch(() => props.resource, () => muya?.invalidateImageCache())
 watch(() => props.active, async active => {
   if (!active) return
   await nextTick()
-  if (props.mode === 'source') source.refresh()
+  if (props.mode === 'source') { source.refresh(); if (props.active) source.focus() }
 })
 onBeforeUnmount(() => { detachSelection?.(); muya?.destroy() })
-defineExpose({ flush, undo, redo, find, replace, reveal })
+defineExpose({ flush, undo, redo, command, find, replace, reveal })
 </script>
 
 <template>

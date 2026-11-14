@@ -15,7 +15,8 @@
   "dependencies": {
     "@muyajs/core": "workspace:*",
     "vue": "^3.5.43",
-    "codemirror": "^5.65.21"
+    "codemirror": "^5.65.21",
+    "marked": "^18.2.0"
   },
   "devDependencies": {
     "@dopame/acde-api": "https://calbin-1318886512.cos.ap-beijing.myqcloud.com/pkgs/acdert/0.0.9/acde-api-0.0.9.tar.gz",

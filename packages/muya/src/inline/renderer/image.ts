@@ -64,7 +64,9 @@ export default function image(
     this: Renderer,
     { h, block, token }: ISyntaxRenderOptions & { token: TSelectableImageToken },
 ) {
-    const imageSrc = getImageSrc(token.attrs.src ?? '');
+    const imageSrc = this.environment.loadImage
+        ? { src: token.attrs.src ?? '', isUnknownType: false }
+        : getImageSrc(token.attrs.src ?? '');
     const selectedImage = this.environment.selectedImage;
     const { translate } = this.environment;
     const data = {

@@ -33,3 +33,7 @@ test('completion of an earlier save does not clear newer input', () => {
   assert.equal(isDirty(tab), true)
   assert.equal(tab.text, '# After')
 })
+
+test('Setext headings and fence lengths use Markdown block parsing', () => {
+  assert.deepEqual(outline('Title\n=====\n\n````md\n```\n# fake\n````\n\n## Real').map(({ content, line }) => ({ content, line })), [{ content: 'Title', line: 0 }, { content: 'Real', line: 8 }])
+})

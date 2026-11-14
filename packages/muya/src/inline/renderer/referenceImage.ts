@@ -24,7 +24,9 @@ export default function referenceImage(
     const rawSrc = label + backlash.second;
     const { href = '', title = '' } = this.environment.references.get(normalizeReferenceLabel(rawSrc)) ?? {};
 
-    const imageSrc = getImageSrc(href);
+    const imageSrc = this.environment.loadImage
+        ? { src: href, isUnknownType: false }
+        : getImageSrc(href);
     const { src } = imageSrc;
     let id;
     let isSuccess;

@@ -1,4 +1,5 @@
 import type { Resource } from './files'
+import { Lexer } from 'marked'
 
 export interface DocumentTab {
   id: string
@@ -35,16 +36,11 @@ export function isDirty(tab: DocumentTab) {
 }
 
 export function outline(text: string) {
-  let fence = ''
-  return editorText(text).split('\n').flatMap((line, index) => {
-    const marker = line.match(/^\s{0,3}(`{3,}|~{3,})/)
-    if (marker) {
-      if (!fence) fence = marker[1][0]
-      else if (fence === marker[1][0]) fence = ''
-      return []
-    }
-    if (fence) return []
-    const heading = line.match(/^(#{1,6})\s+(.+?)(?:\s+#+)?$/)
-    return heading ? [{ lvl: heading[1].length, content: heading[2], slug: '', line: index }] : []
+  let line = 0
+  return Lexer.lex(editorText(text)).flatMap(token => {
+    const start = line
+    line += (token.raw.match(/\n/g) ?? []).length
+    return token.type === 'heading'
+      ? [{ lvl: token.depth, content: token.text, slug: '', line: start }] : []
   })
 }

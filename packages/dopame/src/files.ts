@@ -97,10 +97,73 @@ export async function saveResource(resource: Resource, text: string): Promise<Re
 
 export async function saveAs(name: string, text: string): Promise<{ name: string; resource: Resource }> {
   const handle = await pickers.showSaveFilePicker({ suggestedName: name })
+  // The save picker authorizes creation; a new target has no File to read yet.
+  const writable = await handle.createWritable()
+  try {
+    await writable.write(text)
+    await writable.close()
+  } catch (error) {
+    await writable.abort().catch(() => {})
+    throw error
+  }
   const file = await handle.getFile()
-  const resource = await saveResource(
-    { kind: 'handle', handle, modifiedMs: file.lastModified, size: file.size },
-    text
-  )
+  const resource: Resource = { kind: 'handle', handle, modifiedMs: file.lastModified, size: file.size }
   return { name: handle.name, resource }
+}
+
+
+const directories = new Map<string, FileSystemDirectoryHandle>()
+
+export function registerDirectory(root: string, handle: FileSystemDirectoryHandle) {
+  directories.set(root, handle)
+}
+
+export async function canonicalResource(resource: Resource): Promise<Resource> {
+  if (resource.kind === 'root') return resource
+  for (const [root, directory] of directories) {
+    const path = await directory.resolve(resource.handle)
+    if (path) return (await readResource({ kind: 'root', root, path: path.join('/') })).resource
+  }
+  return resource
+}
+
+export async function resolveImage(resource: Resource | null, src: string): Promise<string> {
+  if (/^(https?:|data:|blob:)/i.test(src)) return src
+  if (!resource) throw new Error('请先保存文档或打开图片所在的文件夹')
+  const location = await canonicalResource(resource)
+  if (location.kind !== 'root') throw new Error('请通过添加文件夹授权此文档的图片目录')
+  if (/^(?:[a-z]+:|[/\\])/i.test(src)) throw new Error('图片路径必须位于已授权文件夹内')
+  const parts = location.path.split('/').slice(0, -1)
+  for (const part of decodeURIComponent(src).replace(/\\/g, '/').split('/')) {
+    if (!part || part === '.') continue
+    if (part === '..') {
+      if (!parts.length) throw new Error('图片路径超出已授权文件夹')
+      parts.pop()
+    } else parts.push(part)
+  }
+  const file = await fs.readBytes(location.root, parts.join('/'))
+  const extension = parts.at(-1)?.split('.').at(-1)?.toLowerCase()
+  const types: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml' }
+  let binary = ''
+  for (const byte of file.data) binary += String.fromCharCode(byte)
+  return `data:${types[extension ?? ''] ?? 'application/octet-stream'};base64,${btoa(binary)}`
+}
+
+
+export async function loadDocumentImage(resource: Resource | null, src: string) {
+  const url = await resolveImage(resource, src)
+  return new Promise<{ url: string; width: number; height: number }>((resolve, reject) => {
+    // acdert 0.0.9 starts image loading only after the element is mounted.
+    const image = document.createElement('img')
+    image.style.cssText = 'position:fixed;left:0;top:0;width:1px;height:1px;visibility:hidden;pointer-events:none'
+    image.setAttribute('aria-hidden', 'true')
+    image.onload = () => {
+      const result = { url, width: image.naturalWidth, height: image.naturalHeight }
+      image.remove()
+      resolve(result)
+    }
+    image.onerror = () => { image.remove(); reject(new Error(`无法加载图片：${src}`)) }
+    document.body.append(image)
+    image.src = url
+  })
 }

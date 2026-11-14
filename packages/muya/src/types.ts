@@ -108,6 +108,8 @@ export interface IMuyaOptions {
      * the raw `src` verbatim.
      */
     imageAction?: (state: IImageActionState) => Promise<string>;
+    /** Load an image through host capabilities without changing its Markdown destination. */
+    loadImage?: (src: string) => Promise<{ url: string; width: number; height: number }>;
     /**
      * Check whether a local image drop can proceed before changing the document.
      * Return undefined for immediate insertion, or a promise resolving to false

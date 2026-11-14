@@ -32,6 +32,7 @@ export interface IInlineCursor {
 }
 
 export interface IInlineEnvironment {
+    readonly loadImage?: (src: string) => Promise<{ url: string; width: number; height: number }>;
     readonly root: HTMLElement;
     readonly readOnly: boolean;
     readonly softNewlineAsSpace: boolean;

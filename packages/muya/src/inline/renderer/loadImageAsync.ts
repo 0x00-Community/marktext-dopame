@@ -6,7 +6,7 @@ import { mountImage } from '../resources/mountImage';
 interface IImageRenderHost {
     images: ImageResources;
     mounts: ImageMounts;
-    environment: { root: HTMLElement };
+    environment: { root: HTMLElement; loadImage?: (src: string) => Promise<{ url: string; width: number; height: number }> };
 }
 
 export default function loadImageAsync(
@@ -23,7 +23,7 @@ export default function loadImageAsync(
         return { ...cached, id: getUniqueId() };
 
     const root = this.environment.root;
-    const id = this.mounts.watch(root, this.images.request(src, isUnknownType), (placeholder, result) => {
+    const id = this.mounts.watch(root, this.images.request(src, isUnknownType, this.environment.loadImage), (placeholder, result) => {
         if (this.images.get(src) !== result)
             return;
         mountImage(placeholder, result, attrs, className, imageClass);

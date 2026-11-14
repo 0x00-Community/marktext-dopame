@@ -44,8 +44,16 @@ acde test
 
 Native tests cover rich input, visible caret, undo/redo, source outline navigation, file operations and a system-picked external folder. Source assertions read CodeMirror's document, not its textarea input buffer. Run `acde test --workers 1 --trace` to retain interaction screenshots.
 
+## Keyboard and document recovery
+
+The host dispatches Ctrl and Cmd explicitly rather than relying on the runtime's reported Linux platform. Both editors support Z / Shift+Z / Y for undo / redo. E and Alt+S toggle source mode; Alt+R toggles reading. Inline code uses the backtick key (also Ctrl+Cmd+C), so E cannot accidentally format while switching modes. Shift+H/M/I/R apply highlight, inline math, image markup and clear formatting; Shift+E is retained as a math alias. Digits 1–6 convert headings and 0 restores a paragraph. Quick-insert block shortcuts are displayed by the menu from the host's mapping. N/T create tabs, W closes the active tab, Ctrl/Cmd+Tab and Shift+Tab cycle tabs. N intentionally remains new-tab rather than opening a second OS window.
+
+Unrecognized or unreadable draft sessions are preserved; automatic session writes remain paused for that launch. Explicit document saves remain available. Newly chosen Save As paths are created through the authorized writable handle.
+
+Relative images resolve inside the document's authorized root, including sibling directories within that root. File-picker documents need their containing folder authorized through Add Folder; individual-file access does not authorize sibling images. Within a launch, the selected directory handle resolves picker files to sidebar identities. acdert 0.0.9 does not preserve usable directory handles through IndexedDB; after reload, use Add Folder again before mixing these two opening routes. Image display URLs do not replace Markdown destinations.
+
 ## Deliberately not included yet
 
-The original renderer's Electron shell integration has not been migrated wholesale. Preferences, recent-file history, image insertion and file watching need follow-up. Desktop services, multi-agent task protocol, grants and immutable artifact handoff from the design document are not implemented. File-picker handles only expose best-effort modification-time/size conflict checks; acde-root saves use SDK versions. Local acde validation is not the required competition Dopame server deployment.
+The original renderer's Electron shell integration has not been migrated wholesale. Preferences, recent-file history, image-file insertion workflows and file watching need follow-up. Desktop services, multi-agent task protocol, grants and immutable artifact handoff from the design document are not implemented. File-picker handles only expose best-effort modification-time/size conflict checks; acde-root saves use SDK versions. Local acde validation is not the required competition Dopame server deployment.
 
 Large MarkText UI chunks trigger the default acde bundle-size warning. The editor dependencies remain bundled locally; app pages cannot import JavaScript modules from a CDN.

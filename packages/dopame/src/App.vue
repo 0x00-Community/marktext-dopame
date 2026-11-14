@@ -2,7 +2,8 @@
 import { computed, markRaw, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { window as appWindow } from 'acde:window'
 import Editor from './Editor.vue'
-import { createNote, fs, openFiles, readResource, requireAvailablePath, saveAs, saveResource, type OpenedFile } from './files'
+import { shortcut } from './shortcuts'
+import { canonicalResource, registerDirectory, createNote, fs, openFiles, readResource, requireAvailablePath, saveAs, saveResource, type OpenedFile } from './files'
 import { containsResource, entryPath, renamedResource } from './filePaths'
 import { createDocument, isDirty, outline, updateDocument, type DocumentTab } from './document'
 
@@ -38,6 +39,7 @@ const closing = ref<DocumentTab[] | null>(null)
 let closeAction: (() => void) | null = null
 let draftTimer: ReturnType<typeof setTimeout>
 let draftQueue = Promise.resolve()
+let sessionWritable = false
 
 function report(reason: unknown) {
   if (reason instanceof Error && reason.name === 'AbortError') return
@@ -55,6 +57,7 @@ function remember() {
 
 function persist() {
   clearTimeout(draftTimer)
+  if (!sessionWritable) return Promise.resolve()
   const snapshot = JSON.stringify({ version: 1, activeId: activeId.value,
     tabs: tabs.map(tab => ({ ...tab, saving: false,
       resource: tab.resource?.kind === 'root' ? tab.resource : null,
@@ -75,8 +78,9 @@ function attach(name: string, text = '', resource: OpenedFile['resource'] | null
 }
 
 async function addFile(file: OpenedFile) {
+  file.resource = await canonicalResource(file.resource)
   for (const tab of tabs) {
-    const current = tab.resource
+    const current = tab.resource ? await canonicalResource(tab.resource) : null
     if (current?.kind === 'root' && file.resource.kind === 'root'
       && current.root === file.resource.root && current.path === file.resource.path) {
       select(tab.id)
@@ -268,6 +272,7 @@ async function pickFolder() {
   roots.value = await fs.roots()
   const picked = roots.value.find(item => item.source === 'granted' && item.label === handle.name)
   if (!picked) throw new Error('已选择的文件夹未出现在系统授权列表中')
+  registerDirectory(picked.id, handle)
   root.value = picked.id
   folder.value = ''
   await refreshFolder()
@@ -347,15 +352,18 @@ onMounted(async () => {
     if (session.version !== 1 || !Array.isArray(session.tabs)) throw new Error('无法读取草稿格式，原记录未覆盖')
     for (const tab of session.tabs) tabs.push({ ...tab, saving: false })
     activeId.value = tabs.some(tab => tab.id === session.activeId) ? session.activeId : tabs[0]?.id ?? ''
+    sessionWritable = true
     if (tabs.length) status.value = '已恢复上次会话；外部单文件请另存为以重新授权'
   } catch (reason) {
-    if ((reason as { code?: string }).code !== 'ENOENT') report(reason)
+    if ((reason as { code?: string }).code === 'ENOENT') sessionWritable = true
+    else report(reason)
   }
   if (!tabs.length) attach('未命名.md')
-  await run(async () => {
+  try {
     roots.value = await fs.roots()
+    if (!roots.value.some(item => item.id === root.value)) root.value = 'private'
     await refreshFolder()
-  })
+  } catch (reason) { report(reason) }
   appWindow.on('request', request => {
     if (request.kind !== 'open-file') return
     void run(async () => {
@@ -381,18 +389,40 @@ onMounted(async () => {
     { id: 'save-as', label: '另存为…', onSelect: () => void run(() => save(active.value, true)) },
   ] }])
   document.addEventListener('keydown', event => {
-    if (!(event.ctrlKey || event.metaKey) || event.isComposing || fileDialog.value) return
-    const key = event.key.toLowerCase()
-    if (!['s', 'o', 'n', 'f'].includes(key)) return
+    if (event.isComposing) return
+    const action = shortcut(event)
+    if (!action) return
+    if (fileDialog.value || closing.value) {
+      if (!(event.target as Element).closest('[role="dialog"]') || !['undo', 'redo'].includes(action)) {
+        event.preventDefault()
+        event.stopImmediatePropagation()
+      }
+      return
+    }
+    const inEditor = !!(event.target as Element).closest('.editor-panel')
+    const editorAction = action === 'undo' || action === 'redo' || action.includes(':')
+    if (editorAction && !inEditor) return
+    if (action.includes(':') && active.value?.mode !== 'edit') return
     event.preventDefault()
-    if (key === 's') void run(() => save(active.value, event.shiftKey))
-    if (key === 'o') void run(open)
-    if (key === 'n') attach('未命名.md')
-    if (key === 'f') {
+    event.stopImmediatePropagation()
+    const editor = editors.get(activeId.value)
+    if (action === 'undo') editor?.undo()
+    else if (action === 'redo') editor?.redo()
+    else if (action.includes(':')) editor?.command(action)
+    else if (action === 'source') setMode(active.value?.mode === 'source' ? 'edit' : 'source')
+    else if (action === 'read') setMode(active.value?.mode === 'read' ? 'edit' : 'read')
+    else if (action === 'save' || action === 'saveAs') void run(() => save(active.value, action === 'saveAs'))
+    else if (action === 'open') void run(open)
+    else if (action === 'new') attach('未命名.md')
+    else if (action === 'close' && active.value) requestClose(active.value)
+    else if (action === 'nextTab' || action === 'previousTab') {
+      const index = tabs.findIndex(tab => tab.id === activeId.value)
+      select(tabs[(index + (action === 'nextTab' ? 1 : tabs.length - 1)) % tabs.length].id)
+    } else if (action === 'find') {
       searchOpen.value = true
       void nextTick(() => document.querySelector<HTMLInputElement>('#find-text')?.focus())
     }
-  })
+  }, true)
 })
 </script>
 
@@ -410,9 +440,9 @@ onMounted(async () => {
       <button @click="searchOpen = !searchOpen">查找替换</button>
       <span class="spacer" />
       <div class="modes" aria-label="编辑模式">
-        <button :aria-pressed="active?.mode === 'edit'" @click="setMode('edit')">编辑</button>
-        <button :aria-pressed="active?.mode === 'source'" @click="setMode('source')">源码</button>
-        <button :aria-pressed="active?.mode === 'read'" @click="setMode('read')">阅读</button>
+        <button :disabled="!active" :aria-pressed="active?.mode === 'edit'" @click="setMode('edit')">编辑</button>
+        <button :disabled="!active" :aria-pressed="active?.mode === 'source'" @click="setMode('source')">源码</button>
+        <button :disabled="!active" :aria-pressed="active?.mode === 'read'" @click="setMode('read')">阅读</button>
       </div>
       <button @click="dark = !dark" aria-label="切换主题">{{ dark ? '浅色' : '深色' }}</button>
     </header>
@@ -420,7 +450,7 @@ onMounted(async () => {
     <section class="workspace">
       <aside class="sidebar" aria-label="文件与大纲">
         <div class="section-heading">文件 <button @click="run(pickFolder)">添加文件夹</button></div>
-        <select v-model="root" aria-label="文件位置" @change="folder = ''; run(refreshFolder)">
+        <select v-if="roots.length" v-model="root" aria-label="文件位置" @change="folder = ''; run(refreshFolder)">
           <option v-for="item in roots" :key="item.id" :value="item.id">{{ item.id === 'private' ? '我的笔记' : item.label }}{{ item.mode === 'read_only' ? '（只读）' : item.mode === 'unavailable' ? '（不可用）' : '' }}</option>
         </select>
         <div class="folder-actions"><button :disabled="!writableRoot || fileBusy" @click="newNote">新建笔记</button><button :disabled="!writableRoot || fileBusy" @click="requestFileAction('folder')">新建文件夹</button><button @click="run(refreshFolder)">刷新</button></div>
@@ -457,7 +487,7 @@ onMounted(async () => {
         </div>
         <Editor v-for="tab in tabs" v-show="tab.id === activeId" :key="tab.id"
           :ref="view => { if (view) editors.set(tab.id, view as EditorView) }"
-          :text="tab.text" :mode="tab.mode" :active="tab.id === activeId"
+          :text="tab.text" :resource="tab.resource" :mode="tab.mode" :active="tab.id === activeId"
           @change="text => change(tab, text)" @outline="items => outlines[tab.id] = items" />
       </section>
     </section>
