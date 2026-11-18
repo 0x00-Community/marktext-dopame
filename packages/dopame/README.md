@@ -4,7 +4,7 @@ A Dopame application shell using MarkText's Muya editor and CodeMirror source mo
 
 - Upstream: https://github.com/marktext/marktext
 - Pinned commit: `18fdc1eddc7d36d9b205180d058982f71f4f6373` (v0.23.0)
-- License: MIT; see the upstream `LICENSE` and `NOTICE.txt`.
+- License: MIT; see the root `LICENSE` and the existing `packages/desktop/build/THIRD-PARTY-LICENSES.txt`.
 - Local changes: `packages/dopame/` is a Vite/Vue entry with acde file, window, picker, and MIME integration. It does not import Electron APIs.
 
 ## Development
@@ -44,7 +44,7 @@ acde test
 
 ## Native input
 
-`nativeSelection.ts` adapts acdert 0.0.9 pointer selection and horizontal caret movement. A DOM overlay paints the real collapsed selection because this runtime does not visibly paint the contenteditable caret in the tested editor. It follows the selection geometry, hides outside the focused editor and in read mode, and is removed when the editor is destroyed. Other runtime versions use their native behavior.
+`nativeSelection.ts` adapts pointer selection and horizontal grapheme navigation for the `acdert/0.0.9` and `acdert/0.0.10` renderer profiles. The competition system binary reports 0.0.11 while its renderer reports `acdert/0.0.10`; these are recorded separately. The DOM caret overlay remains limited to 0.0.9. The overlay follows the real selection, hides outside the focused editor and in read mode, and is removed when the editor is destroyed. Unknown renderer profiles keep native behavior. The validation record distinguishes the tested candidates and target results.
 
 Native tests cover rich input, visible caret, undo/redo, source outline navigation, file operations and a system-picked external folder. Source assertions read CodeMirror's document, not its textarea input buffer. Run `acde test --workers 1 --trace` to retain interaction screenshots.
 
@@ -59,5 +59,7 @@ Relative images resolve inside the document's authorized root, including sibling
 ## Deliberately not included yet
 
 The original renderer's Electron shell integration has not been migrated wholesale. File-picker handles only expose best-effort modification-time/size conflict checks; acde-root saves use SDK versions. Local acde validation is not the required competition Dopame server deployment.
+
+The document protocol, SQLite Coordinator, grants, Proposal transactions, durable tasks and immutable service handoff are implemented in [`../dopame-system`](../dopame-system/README.md). Its separate collaboration entry is an assisted preview without file privileges. A trusted production approval host and system Agent tool registration are not connected, so pairings remain pending and author acceptance is unavailable. The standalone entry here keeps its existing service-independent editing and saving workflow.
 
 Large MarkText UI chunks trigger the default acde bundle-size warning. The editor dependencies remain bundled locally; app pages cannot import JavaScript modules from a CDN.
