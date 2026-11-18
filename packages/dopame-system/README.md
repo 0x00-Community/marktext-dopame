@@ -42,7 +42,7 @@ MARKTEXT_BUN=/absolute/path/to/bun acde dev \
   --desktop packages/dopame-system/.acde/inputs/desktop
 ```
 
-The standalone editor remains independently runnable with `acde dev packages/dopame`. A missing or invalid `MARKTEXT_BUN`, unsafe storage, failed ownership lock or dead worker makes the document service unavailable; it does not grant a weaker storage mode. The development desktop displays this state. Setting the runtime location does not enable approvals or grant permissions.
+The standalone editor remains independently runnable with `acde dev packages/dopame`. A missing or invalid `MARKTEXT_BUN`, unsafe storage, failed ownership lock or dead worker makes the document service unavailable; it does not grant a weaker storage mode. The editor's collaboration sidebar and the caller debugging panel display this unavailable state. Setting the runtime location does not enable approvals or grant permissions.
 
 ## Collaboration edition, day to day
 
