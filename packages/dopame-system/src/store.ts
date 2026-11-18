@@ -21,7 +21,7 @@ export function openStore(stateDir: string) {
       throw new ProtocolError('RECOVERY_REQUIRED', 'The target store does not provide the required locking and durability settings.')
     }
     const version = db.query('PRAGMA user_version').get() as { user_version: number }
-    if (version.user_version !== 0 && version.user_version !== 1) {
+    if (![0, 1, 2].includes(version.user_version)) {
       throw new ProtocolError('RECOVERY_REQUIRED', 'The stored collaboration schema is not supported.')
     }
     db.transaction(() => {
@@ -48,7 +48,9 @@ export function openStore(stateDir: string) {
           id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, epoch TEXT NOT NULL,
           revision TEXT NOT NULL, title TEXT NOT NULL, creator_id TEXT NOT NULL REFERENCES principals(id),
           workflow_id TEXT, saved_revision TEXT, binding_id TEXT, fence TEXT NOT NULL DEFAULT '0',
-          sources TEXT NOT NULL, updated_at TEXT NOT NULL
+          sources TEXT NOT NULL, updated_at TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT '', inbox INTEGER NOT NULL DEFAULT 0,
+          audit TEXT
         );
         CREATE TABLE IF NOT EXISTS snapshots (
           doc_id TEXT NOT NULL REFERENCES documents(id), epoch TEXT NOT NULL,
@@ -60,6 +62,7 @@ export function openStore(stateDir: string) {
           author_id TEXT NOT NULL REFERENCES principals(id), workflow_id TEXT,
           operations TEXT NOT NULL, reason TEXT NOT NULL, sources TEXT NOT NULL,
           digest TEXT NOT NULL, state TEXT NOT NULL, applied_revision TEXT, diff TEXT NOT NULL, created_at TEXT NOT NULL,
+          audit TEXT,
           FOREIGN KEY(doc_id,epoch,base_revision) REFERENCES snapshots(doc_id,epoch,revision)
         );
         CREATE TABLE IF NOT EXISTS approval_tickets (
@@ -71,7 +74,8 @@ export function openStore(stateDir: string) {
           credential_hash TEXT NOT NULL, request_id TEXT NOT NULL, request TEXT NOT NULL,
           scope TEXT NOT NULL, action TEXT NOT NULL, state TEXT NOT NULL,
           cancel_requested INTEGER NOT NULL DEFAULT 0, result TEXT, error TEXT,
-          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          progress TEXT
         );
         CREATE TABLE IF NOT EXISTS idempotency_records (
           principal_id TEXT NOT NULL REFERENCES principals(id), request_id TEXT NOT NULL,
@@ -136,8 +140,29 @@ export function openStore(stateDir: string) {
           undo_id TEXT PRIMARY KEY REFERENCES undo_records(id),
           proposal_id TEXT NOT NULL UNIQUE REFERENCES proposals(id)
         );
-        PRAGMA user_version=1;
       `)
+      // Version 1 stores predate draft provenance. Their creation time stays empty (unknown) rather than
+      // guessed, and inbox origin is inferred from the creator's kind.
+      const docColumns = (db.query('PRAGMA table_info(documents)').all() as { name: string }[]).map(column => column.name)
+      if (!docColumns.includes('created_at')) {
+        db.exec(`
+          ALTER TABLE documents ADD COLUMN created_at TEXT NOT NULL DEFAULT '';
+          ALTER TABLE documents ADD COLUMN inbox INTEGER NOT NULL DEFAULT 0;
+          UPDATE documents SET inbox=(SELECT kind='agent' FROM principals WHERE principals.id=documents.creator_id);
+        `)
+      }
+      if (!docColumns.includes('audit')) {
+        db.exec('ALTER TABLE documents ADD COLUMN audit TEXT;')
+      }
+      const proposalColumns = (db.query('PRAGMA table_info(proposals)').all() as { name: string }[]).map(column => column.name)
+      if (!proposalColumns.includes('audit')) {
+        db.exec('ALTER TABLE proposals ADD COLUMN audit TEXT;')
+      }
+      const taskColumns = (db.query('PRAGMA table_info(tasks)').all() as { name: string }[]).map(column => column.name)
+      if (!taskColumns.includes('progress')) {
+        db.exec('ALTER TABLE tasks ADD COLUMN progress TEXT;')
+      }
+      db.exec('PRAGMA user_version=2')
     })()
     return db
   } catch (error) {

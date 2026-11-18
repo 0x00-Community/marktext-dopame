@@ -1,14 +1,38 @@
 <script setup lang="ts">
-import { computed, markRaw, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, markRaw, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch, type Component } from 'vue'
 import { window as appWindow } from 'acde:window'
 import Editor from './Editor.vue'
 import { shortcut } from './shortcuts'
-import { canonicalResource, registerDirectory, createNote, fs, openFiles, readResource, requireAvailablePath, type OpenedFile } from './files'
+import { canonicalResource, registerDirectory, createNote, fs, openFiles, pickAndImportImage, readResource, requireAvailablePath, type OpenedFile } from './files'
 import { containsResource, entryPath, renamedResource } from './filePaths'
 import { createDocument, documentController, isDirty, outline, updateDocument, type DocumentTab } from './document'
+import type { DocumentRef } from './domain/collaboration'
+import type { EditorLocalState } from './editor/editorPort'
 import { filePort } from './platform/filePort'
-import { parseSession } from './session'
+import { clearRecentFiles, loadPreferences, loadRecentFiles, recordRecentFile, savePreferences, type EditorPreferences, type RecentFileEntry } from './preferences'
+import { parseSession, resolveWindowSession } from './session'
+import { distinctNames } from './collaboration/viewModel'
 
+// The collaboration edition passes its service and module in. The standalone edition has neither: it
+// keeps only this inert shell (a hidden button and openDraft), with no service or approval call.
+const props = defineProps<{ collaboration?: unknown; collaborationModule?: Component }>()
+const collaborationOpen = ref(localStorage.getItem('collaboration-panel') !== 'closed')
+const pendingPairings = ref(0)
+const windowSession = resolveWindowSession(typeof sessionStorage !== 'undefined' ? sessionStorage : undefined)
+// Held while an accept, reject or undo is in flight: the document must not change underneath it.
+const reviewGate = ref(false)
+interface PreparedCollabSave {
+  document: DocumentRef
+  saveId?: string
+  resourceKey?: string
+  target?: 'root' | 'handle'
+}
+interface CollaborationHandle {
+  beforeSave(tabId: string, text: string, resource: OpenedFile['resource'] | null): Promise<PreparedCollabSave | undefined>
+  afterSave(tabId: string, prepared: PreparedCollabSave, outcome: { status: 'saved' | 'conflict' | 'unknown' | 'reauthorize' | 'cancelled'; text?: string; resource?: OpenedFile['resource'] }): Promise<void>
+  onWindowRequest?(request: Record<string, unknown>): boolean
+}
+const collabModule = ref<CollaborationHandle>()
 type EditorView = InstanceType<typeof Editor>
 type Heading = { lvl: number; content: string; slug: string }
 const tabs = reactive<DocumentTab[]>([])
@@ -18,9 +42,14 @@ const editors = new Map<string, EditorView>()
 const outlines = reactive<Record<string, Heading[]>>({})
 const headings = computed(() => active.value?.mode === 'source'
   ? outline(active.value.text) : outlines[activeId.value] ?? [])
+const tabNames = computed(() => distinctNames(tabs.map(tab => ({ name: tab.name, hint: tabLocation(tab), key: tab.id.slice(0, 4) }))))
 const error = ref('')
 const status = ref('就绪')
+const preferences = reactive<EditorPreferences>(loadPreferences())
 const dark = ref(localStorage.getItem('theme') === 'dark')
+const prefsOpen = ref(false)
+const recentFiles = ref<RecentFileEntry[]>(loadRecentFiles())
+const leaseReadonly = ref(false)
 const searchOpen = ref(false)
 const search = ref('')
 const replacement = ref('')
@@ -39,12 +68,33 @@ const fileTitle = computed(() => ({ note: '新建笔记', folder: '新建文件�
 const truncated = ref(false)
 const closing = ref<DocumentTab[] | null>(null)
 const closeBusy = ref(false)
-const modalOpen = computed(() => !!fileDialog.value || !!closing.value)
+const modalOpen = computed(() => !!fileDialog.value || !!closing.value || prefsOpen.value)
 let modalReturnFocus: HTMLElement | null = null
 let closeAction: (() => void) | null = null
 let draftTimer: ReturnType<typeof setTimeout>
+let externalWatchTimer: ReturnType<typeof setInterval> | undefined
 let draftQueue = Promise.resolve()
 let sessionWritable = false
+
+function trackRecentResource(resource: OpenedFile['resource'] | null | undefined, name?: string) {
+  if (resource?.kind === 'root') {
+    const place = roots.value.find(item => item.id === resource.root)
+    recentFiles.value = recordRecentFile(recentFiles.value, {
+      root: resource.root,
+      rootLabel: resource.root === 'private' ? '我的笔记' : place?.label ?? '已授权文件夹',
+      path: resource.path,
+      name: name ?? resource.path.split('/').at(-1) ?? resource.path,
+    })
+  }
+}
+
+function tabLocation(tab: DocumentTab) {
+  if (!tab.resource) return '未保存到文件'
+  if (tab.resource.kind === 'handle') return '外部文件'
+  const place = roots.value.find(item => item.id === (tab.resource as { root: string }).root)
+  const folderPath = tab.resource.path.split('/').slice(0, -1).join('/')
+  return `${tab.resource.root === 'private' ? '我的笔记' : place?.label ?? '已授权文件夹'}${folderPath ? `/${folderPath}` : ''}`
+}
 
 function report(reason: unknown) {
   if (reason instanceof Error && reason.name === 'AbortError') return
@@ -64,7 +114,7 @@ function persist() {
   clearTimeout(draftTimer)
   if (!sessionWritable) return Promise.resolve()
   const snapshot = JSON.stringify({ version: 1, activeId: activeId.value,
-    tabs: tabs.map(tab => ({ ...tab, saving: false,
+    tabs: tabs.map(tab => ({ ...tab, saving: false, collab: undefined,
       resource: tab.resource?.kind === 'root' ? tab.resource : null,
       savedText: tab.resource?.kind === 'handle' ? null : tab.savedText })) })
   draftQueue = draftQueue.then(async () => {
@@ -86,6 +136,7 @@ function attach(name: string, text = '', resource: OpenedFile['resource'] | null
 async function addFile(file: OpenedFile) {
   if (modalOpen.value || inputBusy()) return
   file.resource = await canonicalResource(file.resource)
+  trackRecentResource(file.resource, file.name)
   for (const tab of tabs) {
     const current = tab.resource ? await canonicalResource(tab.resource) : null
     if (current?.kind === 'root' && file.resource.kind === 'root'
@@ -102,8 +153,55 @@ async function addFile(file: OpenedFile) {
   attach(file.name, file.text, file.resource)
 }
 
-function select(id: string) {
+async function openRecentFile(entry: RecentFileEntry) {
   if (modalOpen.value || inputBusy()) return
+  await addFile(await readResource({ kind: 'root', root: entry.root, path: entry.path }))
+}
+
+function clearRecents() {
+  clearRecentFiles()
+  recentFiles.value = []
+}
+
+async function insertImage() {
+  if (!active.value || active.value.mode === 'read' || modalOpen.value || reviewGate.value || leaseReadonly.value || inputBusy()) return
+  const tabResource = active.value.resource
+  let targetRoot = root.value
+  let targetFolder = folder.value
+  if (tabResource?.kind === 'root' && roots.value.find(item => item.id === tabResource.root)?.mode === 'writable') {
+    targetRoot = tabResource.root
+    targetFolder = tabResource.path.split('/').slice(0, -1).join('/')
+  } else if (!writableRoot.value) {
+    targetRoot = 'private'
+    targetFolder = ''
+  }
+  const imported = await pickAndImportImage(targetRoot, targetFolder)
+  if (!imported) return
+  editors.get(activeId.value)?.insertSnippet(imported.markdown)
+  status.value = `已插入图片 ${imported.relativePath}`
+  await refreshFolder()
+}
+
+function openPreferences() {
+  if (modalOpen.value || inputBusy()) return
+  editors.get(activeId.value)?.flush()
+  prefsOpen.value = true
+  void nextTick(() => {
+    document.querySelector<HTMLInputElement>('#pref-font-size')?.focus()
+  })
+}
+
+function closePreferences() {
+  prefsOpen.value = false
+}
+
+function prefsDialogKey(event: KeyboardEvent) {
+  if (event.key === 'Escape') { event.preventDefault(); closePreferences() }
+  trapDialogFocus(event)
+}
+
+function select(id: string) {
+  if (modalOpen.value || reviewGate.value || inputBusy()) return
   editors.get(activeId.value)?.flush()
   activeId.value = id
   remember()
@@ -115,7 +213,7 @@ function change(tab: DocumentTab, text: string) {
 }
 
 function setMode(mode: DocumentTab['mode']) {
-  if (!active.value || modalOpen.value || inputBusy()) return
+  if (!active.value || modalOpen.value || reviewGate.value || inputBusy()) return
   editors.get(activeId.value)?.flush()
   active.value.mode = mode
   remember()
@@ -131,7 +229,7 @@ function inputBusy() {
 }
 
 async function save(tab = active.value, copy = false, fromCloseDialog = false) {
-  if (!tab || tab.saving || fileBusy.value || (modalOpen.value && !fromCloseDialog) || inputBusy()) return
+  if (!tab || tab.saving || fileBusy.value || (modalOpen.value && !fromCloseDialog) || reviewGate.value || inputBusy()) return
   const resource = tab.resource
   if (!copy && resource?.kind === 'root'
     && roots.value.find(item => item.id === resource.root)?.mode === 'read_only') {
@@ -140,13 +238,69 @@ async function save(tab = active.value, copy = false, fromCloseDialog = false) {
   editors.get(tab.id)?.flush()
   const snapshot = documentController.captureSave(tab)
   tab.saving = true
+  const collaboration = collabModule.value
+  let prepared: PreparedCollabSave | undefined
   try {
+    // Two-phase outbox when saving in-place to an existing target (`!copy`); Save As (`copy`) binds the new target after selection.
+    prepared = tab.collab && collaboration ? await collaboration.beforeSave(tab.id, snapshot.text, copy ? null : snapshot.resource) : undefined
     const saved = await filePort.save(snapshot, copy)
     documentController.acknowledgeSave(tab, snapshot, markRaw(saved.resource), saved.name)
+    trackRecentResource(saved.resource, saved.name)
     status.value = `已保存 ${tab.name}`
+    if (prepared && collaboration) {
+      void collaboration.afterSave(tab.id, prepared, { status: 'saved', text: snapshot.text, resource: saved.resource })
+    }
     await persist()
     await refreshFolder()
+  } catch (reason) {
+    const code = (reason as { code?: string }).code
+    if (prepared && collaboration) {
+      if (reason instanceof Error && reason.name === 'AbortError') {
+        if (prepared.saveId) void collaboration.afterSave(tab.id, prepared, { status: 'cancelled' })
+      } else {
+        const outcomeStatus = code === 'ECONFLICT' ? 'conflict' : code === 'EACCES' || code === 'EPERM' ? 'reauthorize' : 'unknown'
+        void collaboration.afterSave(tab.id, prepared, { status: outcomeStatus })
+      }
+    }
+    if (code !== 'ECONFLICT') throw reason
+    throw new Error(`「${tab.name}」已在外部被修改，外部内容未被覆盖，本地编辑已保留。请用“另存为”或“导出副本”保存当前内容，或复制后重新打开。`, { cause: reason })
   } finally { tab.saving = false }
+}
+
+function openDraft(draft: { title: string; markdown: string; document?: DocumentRef }) {
+  const bound = draft.document && tabs.find(tab => tab.collab?.docId === draft.document?.docId)
+  if (bound) { select(bound.id); return }
+  const tab = attach(/\.(md|markdown|txt)$/i.test(draft.title) ? draft.title : `${draft.title}.md`, draft.markdown)
+  if (!tab) {
+    error.value = '请先完成当前输入或关闭对话框，再打开草稿。'
+    return
+  }
+  if (draft.document) tab.collab = draft.document
+  status.value = draft.document ? `已打开协作文档 ${draft.title}；修改会同步到协作服务`
+    : `已打开草稿副本 ${draft.title}；收件箱中的原草稿未改变`
+}
+
+function applyCommitted(change: { tabId: string; markdown: string; document: DocumentRef }) {
+  const tab = tabs.find(item => item.id === change.tabId)
+  if (!tab) return
+  editors.get(tab.id)?.applyExternal(change.markdown)
+  updateDocument(tab, change.markdown)
+  tab.collab = change.document
+  remember()
+}
+
+function setCollaboration(change: { tabId: string; document?: DocumentRef; reason?: string }) {
+  const tab = tabs.find(item => item.id === change.tabId)
+  if (!tab) return
+  tab.collab = change.document
+  if (!change.document && change.reason) error.value = change.reason
+}
+
+async function exportCopy(tab = active.value) {
+  if (!tab || tab.saving || fileBusy.value || modalOpen.value || inputBusy()) return
+  editors.get(tab.id)?.flush()
+  const exported = await filePort.exportCopy(documentController.captureSave(tab))
+  status.value = `已导出副本 ${exported.name}；${tab.name} 的保存目标未改变`
 }
 
 function newNote() {
@@ -177,7 +331,7 @@ function fileDialogKey(event: KeyboardEvent) {
 
 function trapDialogFocus(event: KeyboardEvent) {
   if (event.key !== 'Tab') return
-  const controls = Array.from((event.currentTarget as HTMLElement).querySelectorAll<HTMLElement>('input:not(:disabled), button:not(:disabled)'))
+  const controls = Array.from((event.currentTarget as HTMLElement).querySelectorAll<HTMLElement>('input:not(:disabled), select:not(:disabled), button:not(:disabled)'))
   if (!controls.length) { event.preventDefault(); return }
   const next = event.shiftKey ? controls.at(-1) : controls[0]
   if (!controls.includes(document.activeElement as HTMLElement)
@@ -306,7 +460,7 @@ function removeTab(id: string) {
 }
 
 function requestClose(tab: DocumentTab) {
-  if (modalOpen.value || inputBusy()) return
+  if (modalOpen.value || reviewGate.value || inputBusy()) return
   editors.get(tab.id)?.flush()
   if (!isDirty(tab)) { removeTab(tab.id); return }
   closing.value = [tab]
@@ -376,10 +530,21 @@ watch(dark, value => {
   document.documentElement.style.colorScheme = value ? 'dark' : 'light'
   localStorage.setItem('theme', value ? 'dark' : 'light')
 }, { immediate: true })
+watch(() => [preferences.fontSize, preferences.lineHeight, preferences.autoPairMarkdownSyntax, preferences.lineNumbers, preferences.watchExternalSeconds], () => {
+  savePreferences(preferences)
+})
+watch(() => preferences.watchExternalSeconds, seconds => {
+  clearInterval(externalWatchTimer)
+  externalWatchTimer = undefined
+  if (seconds > 0) {
+    externalWatchTimer = setInterval(() => { void run(checkExternal) }, seconds * 1000)
+  }
+}, { immediate: true })
 watch(() => [active.value?.name, active.value?.text, active.value?.savedText], () => {
   document.title = `${active.value && isDirty(active.value) ? '● ' : ''}${active.value?.name ?? 'MarkText'} — MarkText · Dopame`
 })
 watch(search, () => find())
+watch(collaborationOpen, open => localStorage.setItem('collaboration-panel', open ? 'open' : 'closed'))
 watch(modalOpen, async (opened) => {
   if (opened) {
     modalReturnFocus = document.activeElement as HTMLElement | null
@@ -390,6 +555,9 @@ watch(modalOpen, async (opened) => {
     if (modalReturnFocus?.isConnected) modalReturnFocus.focus()
     modalReturnFocus = null
   }
+})
+onBeforeUnmount(() => {
+  clearInterval(externalWatchTimer)
 })
 
 onMounted(async () => {
@@ -411,16 +579,21 @@ onMounted(async () => {
     await refreshFolder()
   } catch (reason) { report(reason) }
   appWindow.on('request', request => {
-    if (request.kind !== 'open-file') return
-    void run(async () => {
-      const handle = (request as { handle: FileSystemFileHandle }).handle
-      const file = await handle.getFile()
-      await addFile(await readResource({ kind: 'handle', handle, modifiedMs: file.lastModified, size: file.size }))
-    })
+    if (request.kind === 'open-file') {
+      void run(async () => {
+        const handle = (request as { handle: FileSystemFileHandle }).handle
+        const file = await handle.getFile()
+        await addFile(await readResource({ kind: 'handle', handle, modifiedMs: file.lastModified, size: file.size }))
+      })
+      return
+    }
+    if (collabModule.value?.onWindowRequest?.(request as unknown as Record<string, unknown>)) {
+      collaborationOpen.value = true
+    }
   })
   appWindow.on('activate', () => void run(checkExternal))
   appWindow.on('beforeclose', () => {
-    if (fileBusy.value || modalOpen.value || inputBusy()) return false
+    if (fileBusy.value || modalOpen.value || reviewGate.value || inputBusy()) return false
     for (const editor of editors.values()) editor.flush()
     const dirty = tabs.filter(isDirty)
     if (!dirty.length) { void persist(); return true }
@@ -433,12 +606,22 @@ onMounted(async () => {
     { id: 'open', label: '打开…', onSelect: () => void run(open) },
     { id: 'save', label: '保存', onSelect: () => void run(() => save()) },
     { id: 'save-as', label: '另存为…', onSelect: () => void run(() => save(active.value, true)) },
+    { id: 'export-copy', label: '导出副本…', onSelect: () => void run(() => exportCopy()) },
+    { id: 'insert-image', label: '插入图片…', onSelect: () => void run(insertImage) },
+    { id: 'preferences', label: '偏好设置…', onSelect: () => openPreferences() },
   ] }])
   document.addEventListener('keydown', event => {
     if (modalOpen.value) {
       const action = shortcut(event)
       if (!action) return
       if (!(event.target as Element).closest('[role="dialog"]') || !['undo', 'redo'].includes(action)) {
+        event.preventDefault()
+        event.stopImmediatePropagation()
+      }
+      return
+    }
+    if (reviewGate.value) {
+      if (shortcut(event)) {
         event.preventDefault()
         event.stopImmediatePropagation()
       }
@@ -482,9 +665,11 @@ onMounted(async () => {
       <button @click="run(open)" title="Ctrl+O">打开</button>
       <button :disabled="active?.saving" @click="run(() => save())" title="Ctrl+S">保存</button>
       <button @click="run(() => save(active, true))">另存为</button>
+      <button :disabled="active?.saving" title="写出一份副本，不改变此文档的保存目标" @click="run(() => exportCopy())">导出副本</button>
       <span class="divider" />
-      <button :disabled="active?.mode === 'read'" @mousedown.prevent @click="editors.get(activeId)?.undo()">撤销</button>
-      <button :disabled="active?.mode === 'read'" @mousedown.prevent @click="editors.get(activeId)?.redo()">重做</button>
+      <button :disabled="active?.mode === 'read' || leaseReadonly" @mousedown.prevent @click="editors.get(activeId)?.undo()">撤销</button>
+      <button :disabled="active?.mode === 'read' || leaseReadonly" @mousedown.prevent @click="editors.get(activeId)?.redo()">重做</button>
+      <button :disabled="!active || active?.mode === 'read' || leaseReadonly" @click="run(insertImage)">插入图片</button>
       <button @click="searchOpen = !searchOpen">查找替换</button>
       <span class="spacer" />
       <div class="modes" aria-label="编辑模式">
@@ -492,6 +677,8 @@ onMounted(async () => {
         <button :disabled="!active" :aria-pressed="active?.mode === 'source'" @click="setMode('source')">源码</button>
         <button :disabled="!active" :aria-pressed="active?.mode === 'read'" @click="setMode('read')">阅读</button>
       </div>
+      <button v-if="props.collaborationModule" :aria-pressed="collaborationOpen" :aria-label="pendingPairings ? `协作（${pendingPairings} 个待处理配对）` : '协作'" @click="collaborationOpen = !collaborationOpen">协作{{ pendingPairings ? `（${pendingPairings}）` : '' }}</button>
+      <button @click="openPreferences" aria-label="偏好设置">偏好设置</button>
       <button @click="dark = !dark" aria-label="切换主题">{{ dark ? '浅色' : '深色' }}</button>
     </header>
     <div v-if="error" role="alert" class="error-banner"><span>{{ error }}</span><button @click="error = ''">关闭提示</button></div>
@@ -512,6 +699,19 @@ onMounted(async () => {
           <p v-if="!entries.length" class="hint">此处没有 Markdown 文件</p>
           <p v-if="truncated" class="hint">目录内容过多，列表已截断</p>
         </nav>
+        <template v-if="recentFiles.length">
+          <div class="section-heading outline-title">最近文件 <button @click="clearRecents">清空</button></div>
+          <nav class="recent-files" aria-label="最近文件">
+            <button
+              v-for="item in recentFiles"
+              :key="`${item.root}:${item.path}`"
+              :title="`${item.root === 'private' ? '我的笔记' : item.root}/${item.path}`"
+              @click="run(() => openRecentFile(item))"
+            >
+              <span>≡</span>{{ item.name }}
+            </button>
+          </nav>
+        </template>
         <div class="section-heading outline-title">文档大纲</div>
         <nav class="outline" aria-label="文档大纲">
           <button v-for="(item, index) in headings" :key="index" :style="{ paddingLeft: `${12 + (item.lvl - 1) * 12}px` }" @click="editors.get(activeId)?.reveal(item.slug, index)">{{ item.content }}</button>
@@ -520,26 +720,44 @@ onMounted(async () => {
       </aside>
       <section class="documents">
         <nav class="tabs" role="tablist" aria-label="打开的文档">
-          <div v-for="tab in tabs" :key="tab.id" class="tab" :class="{ selected: tab.id === activeId }">
-            <button role="tab" :aria-selected="tab.id === activeId" @click="select(tab.id)">{{ isDirty(tab) ? '● ' : '' }}{{ tab.name }}</button>
-            <button :aria-label="`关闭 ${tab.name}`" @click="requestClose(tab)">×</button>
+          <div v-for="(tab, index) in tabs" :key="tab.id" class="tab" :class="{ selected: tab.id === activeId }">
+            <button role="tab" :aria-selected="tab.id === activeId" :title="tabLocation(tab)"
+              :aria-label="tabNames[index] === tab.name ? undefined : `${isDirty(tab) ? '● ' : ''}${tabNames[index]}`"
+              @click="select(tab.id)">{{ isDirty(tab) ? '● ' : '' }}{{ tab.name }}</button>
+            <button :aria-label="`关闭 ${tabNames[index]}`" @click="requestClose(tab)">×</button>
           </div>
         </nav>
         <div v-if="searchOpen" class="search-bar" aria-label="查找替换">
           <input id="find-text" v-model="search" aria-label="查找文本" placeholder="查找" @keydown.enter="find()">
           <button @click="find(true)">上一个</button><button @click="find()">下一个</button>
           <input v-model="replacement" aria-label="替换文本" placeholder="替换为">
-          <button :disabled="active?.mode === 'read'" @click="editors.get(activeId)?.replace(replacement, false)">替换</button>
-          <button :disabled="active?.mode === 'read'" @click="editors.get(activeId)?.replace(replacement, true)">全部替换</button>
+          <button :disabled="active?.mode === 'read' || leaseReadonly" @click="editors.get(activeId)?.replace(replacement, false)">替换</button>
+          <button :disabled="active?.mode === 'read' || leaseReadonly" @click="editors.get(activeId)?.replace(replacement, true)">全部替换</button>
           <button @click="searchOpen = false; search = ''">收起</button>
         </div>
         <Editor v-for="tab in tabs" v-show="tab.id === activeId" :key="tab.id"
           :ref="view => { if (view) editors.set(tab.id, view as EditorView) }"
-          :text="tab.text" :resource="tab.resource" :mode="tab.mode" :active="tab.id === activeId" :blocked="modalOpen"
+          :text="tab.text" :resource="tab.resource" :mode="tab.mode" :active="tab.id === activeId"
+          :blocked="modalOpen || reviewGate || (tab.id === activeId && leaseReadonly)"
+          :preferences="preferences"
           @change="text => change(tab, text)" @outline="items => outlines[tab.id] = items" />
       </section>
+      <component :is="props.collaborationModule" v-if="props.collaborationModule" v-show="collaborationOpen" ref="collabModule"
+        :service="props.collaboration" :documents="tabs" :active-id="activeId" :window-session-id="windowSession.windowSessionId"
+        :is-busy="() => modalOpen || reviewGate || inputBusy()"
+        :flush="(id: string) => editors.get(id)?.flush()"
+        :flush-async="(id: string) => editors.get(id)?.flushCompletedInput() ?? Promise.resolve()"
+        :port-state="(id: string): EditorLocalState | undefined => editors.get(id)?.getPortState()"
+        :acknowledge-commit="(id: string, rev: string, seq?: number) => editors.get(id)?.acknowledgeCommit(rev, seq)"
+        :selected-range="(id: string) => editors.get(id)?.getSelectedRange()"
+        @open-draft="openDraft" @bound="setCollaboration" @apply="applyCommitted" @gate="(on: boolean) => reviewGate = on"
+        @pending="(count: number) => pendingPairings = count"
+        @lease-readonly="(ro: boolean) => leaseReadonly = ro" />
     </section>
-    <footer role="status"><span>{{ status }}</span><span v-if="active">{{ active.saving ? '保存中…' : isDirty(active) ? '未保存' : '已保存' }} · {{ active.text.length }} 字符 · UTF-8{{ active.bom ? ' BOM' : '' }} · {{ active.eol === '\r\n' ? 'CRLF' : 'LF' }}</span></footer>
+    <footer role="status">
+      <span>{{ status }}{{ leaseReadonly ? ' · 只读跟随（其他窗口持有写入权）' : '' }}</span>
+      <span v-if="active">{{ active.saving ? '保存中…' : isDirty(active) ? '未保存' : '已保存' }} · {{ active.text.length }} 字符 · UTF-8{{ active.bom ? ' BOM' : '' }} · {{ active.eol === '\r\n' ? 'CRLF' : 'LF' }}</span>
+    </footer>
     <div v-if="fileDialog" class="dialog-backdrop" @keydown="fileDialogKey">
       <form id="file-dialog" tabindex="-1" role="dialog" aria-modal="true" aria-labelledby="file-title" aria-describedby="file-location" class="dialog" @submit.prevent="submitFileAction">
         <h2 id="file-title">{{ fileTitle }}</h2>
@@ -566,6 +784,39 @@ onMounted(async () => {
         <div class="dialog-actions"><button id="cancel-close" :disabled="closeBusy" @click="cancelClose">取消</button><button :disabled="closeBusy" @click="finishClose">不保存并关闭</button><button :disabled="closeBusy" class="primary" @click="run(saveAndClose)">{{ closeBusy ? '保存中…' : '保存并关闭' }}</button></div>
       </section>
     </div>
+    <div v-if="prefsOpen" class="dialog-backdrop" @keydown="prefsDialogKey">
+      <section id="prefs-dialog" tabindex="-1" role="dialog" aria-modal="true" aria-labelledby="prefs-title" class="dialog">
+        <h2 id="prefs-title">编辑器偏好设置</h2>
+        <div class="pref-row">
+          <label for="pref-font-size">字体大小（12–28 px）</label>
+          <input id="pref-font-size" v-model.number="preferences.fontSize" type="number" min="12" max="28">
+        </div>
+        <div class="pref-row">
+          <label for="pref-line-height">行高（1.2–2.4）</label>
+          <input id="pref-line-height" v-model.number="preferences.lineHeight" type="number" min="1.2" max="2.4" step="0.05">
+        </div>
+        <div class="pref-row">
+          <label for="pref-watch-external">外部文件轮询检查间隔</label>
+          <select id="pref-watch-external" v-model.number="preferences.watchExternalSeconds">
+            <option :value="0">仅在激活窗口时检查（默认）</option>
+            <option :value="5">每 5 秒检查一次</option>
+            <option :value="15">每 15 秒检查一次</option>
+            <option :value="30">每 30 秒检查一次</option>
+          </select>
+        </div>
+        <label class="pref-check">
+          <input v-model="preferences.autoPairMarkdownSyntax" type="checkbox">
+          自动配对 Markdown 符号与括号
+        </label>
+        <label class="pref-check">
+          <input v-model="preferences.lineNumbers" type="checkbox">
+          在源码模式下显示行号
+        </label>
+        <div class="dialog-actions">
+          <button id="close-prefs" type="button" class="primary" @click="closePreferences">完成</button>
+        </div>
+      </section>
+    </div>
   </main>
 </template>
 
@@ -574,6 +825,11 @@ onMounted(async () => {
 .file-entry > button:first-child { flex: 1; min-width: 0; }
 .file-entry > button:not(:first-child) { width: auto; padding: 6px 4px; font-size: 11px; flex-shrink: 0; }
 .folder-actions > button { padding: 7px 5px; }
+.recent-files { display: flex; flex-direction: column; max-height: 130px; overflow: auto; border-bottom: 1px solid var(--line); }
+.recent-files > button { text-align: left; width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #file-name { display: block; width: 100%; margin-top: 8px; }
 #file-location { overflow-wrap: anywhere; }
+.pref-row { display: flex; flex-direction: column; gap: 4px; margin: 10px 0; }
+.pref-row input, .pref-row select { padding: 6px 8px; }
+.pref-check { display: flex; align-items: center; gap: 8px; margin: 8px 0; font-size: 13px; }
 </style>

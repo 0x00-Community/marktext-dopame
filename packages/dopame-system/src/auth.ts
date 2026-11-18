@@ -6,6 +6,9 @@ export interface ResourceScope {
   artifactId?: string
   workflowId?: string
   purpose?: string
+  allowedBlockIds?: string[]
+  maxAuditRetries?: number
+  requireAudit?: boolean
 }
 
 export interface GrantInput {
@@ -38,6 +41,8 @@ export interface ApprovalEvidence {
 
 /** Implementations belong to a trusted host; RPC, renderer flags and DOM events cannot issue evidence. */
 export interface ApprovalPort {
+  /** Published in the capability catalog so callers can tell a development host from a protected one. */
+  readonly mode?: string
   verify(ticket: string, expected: ApprovalBinding): ApprovalEvidence | null
 }
 

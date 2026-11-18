@@ -1,9 +1,19 @@
-import { test, expect } from 'acde/test'
+import { test, expect, type Acde } from 'acde/test'
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
+/** The desktop opens MarkText on start; a test uses that window, or opens one when none is there. */
+async function appWindow(acde: Acde, app: string) {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    if ((await acde.windows()).some(window => (window as { app?: string | null }).app === app)) return acde.window({ app })
+    await new Promise(resolve => setTimeout(resolve, 200))
+  }
+  return acde.open(app)
+}
+
+
 test('preview requests pairing without exposing approval, document edits or file capabilities', async({ acde }) => {
-  const page = await acde.open('marktext-dopame')
+  const page = await appWindow(acde, 'marktext-agent-preview')
   await expect(page.getByRole('status')).toContainText('服务已连接')
   await expect(page.getByRole('heading', { name: '连接与授权', exact: true })).toBeVisible()
   await page.getByRole('textbox', { name: '调用方名称' }).fill('界面研究调用方')
@@ -19,8 +29,10 @@ test('preview requests pairing without exposing approval, document edits or file
 })
 
 test('preview navigation keeps real empty and disabled states at narrow widths', async({ acde }) => {
-  const page = await acde.open('marktext-dopame')
+  const page = await appWindow(acde, 'marktext-agent-preview')
   await expect(page.getByRole('status')).toContainText('服务已连接')
+  // The desktop fills the screen with the window it opens; resizing needs a normal window.
+  await page.restore()
   const screenshots = process.env.MARKTEXT_REVIEW_SCREENSHOTS
   if (screenshots) {
     await mkdir(screenshots, { recursive: true })

@@ -36,6 +36,10 @@ acde test
 - Create notes and folders, rename and delete in the current location; picking an external folder opens it immediately. Unsaved documents block destructive file operations.
 - Open, create, save and Save As Markdown files using acde roots and standard file pickers.
 - UTF-8 text with BOM and LF/CRLF preservation, revision-checked writes for acde roots, dirty indicators, draft recovery, search/replace, undo/redo, and light/dark themes.
+- Export Copy writes the current text to a newly chosen file without changing the document's save target or dirty state.
+- Files that are not UTF-8 are refused with an explanation instead of being decoded lossily; a save that meets an external change keeps both the external file and the local edit.
+- Tabs that share a name expose their location in the accessible name.
+- Preferences modal dialog (font size, line height, Markdown auto-pairing, source line numbers, optional external file polling interval), recent-file history in the sidebar, and local image-file picker insertion (`assets/` copy + Markdown snippet insertion).
 - File associations and system menus.
 
 ## Native input
@@ -54,6 +58,6 @@ Relative images resolve inside the document's authorized root, including sibling
 
 ## Deliberately not included yet
 
-The original renderer's Electron shell integration has not been migrated wholesale. Preferences, recent-file history, image-file insertion workflows and file watching need follow-up. Desktop services, multi-agent task protocol, grants and immutable artifact handoff from the design document are not implemented. File-picker handles only expose best-effort modification-time/size conflict checks; acde-root saves use SDK versions. Local acde validation is not the required competition Dopame server deployment.
+The original renderer's Electron shell integration has not been migrated wholesale. File-picker handles only expose best-effort modification-time/size conflict checks; acde-root saves use SDK versions. Local acde validation is not the required competition Dopame server deployment.
 
 Large MarkText UI chunks trigger the default acde bundle-size warning. The editor dependencies remain bundled locally; app pages cannot import JavaScript modules from a CDN.

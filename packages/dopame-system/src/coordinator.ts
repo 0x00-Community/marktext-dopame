@@ -1,19 +1,23 @@
 import type { Database, SQLValue } from 'bun:sqlite'
 import { randomUUID } from 'node:crypto'
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { dirname, join, resolve, sep } from 'node:path'
 import { applyOperations, applyTextChanges, assertRange, assertText, createSnapshot,
   limits, nextRevision, ProtocolError, serializeMarkdown,
   type BlockOperation, type DocumentRef, type DocumentSnapshot, type EditQuota, type TextChange } from '../../dopame/src/domain/collaboration'
 import { suggestReverseOperations } from '../../dopame/src/domain/reverseProposal'
 import { canonical, digest, hostApprovalBinding, opaqueSecret, type ApprovalBinding, type ApprovalPort, type GrantInput, type ResourceScope } from './auth'
 import { openStore } from './store'
-import { validateRequest, protocolSchema, capabilitySchemas, type RequestEnvelope } from './protocol'
+import type { ApprovedGenerationInput, SystemModelPort, WritingPurpose } from './modelPort'
+import { validateRequest, protocolSchema, capabilitySchemas, capabilityResultSchemas, taskReceiptSchema,
+  sanitizeContent, type AuditMetadata, type InquiryResolution, type TaskInquiry, type TaskProgress, type RequestEnvelope } from './protocol'
 
 interface Principal { id: string; name: string; kind: string; active: number; generation: number }
 interface Credential { hash: string; principal_id: string; expires_at: string; generation: number }
 interface GrantRow { id: string; principal_id: string; scope: string; actions: string; expires_at: string; revoked: number; delegation_depth: number; parent_id: string | null }
-interface DocumentRow { id: string; workspace_id: string; epoch: string; revision: string; title: string; creator_id: string; workflow_id: string | null; saved_revision: string | null; binding_id: string | null; fence: string; sources: string; updated_at: string }
-interface ProposalRow { id: string; doc_id: string; epoch: string; base_revision: string; author_id: string; workflow_id: string | null; operations: string; reason: string; sources: string; digest: string; state: string; applied_revision: string | null; diff: string; created_at: string }
-interface TaskRow { id: string; principal_id: string; credential_hash: string; request_id: string; request: string; scope: string; action: string; state: string; cancel_requested: number; result: string | null; error: string | null; created_at: string; updated_at: string }
+interface DocumentRow { id: string; workspace_id: string; epoch: string; revision: string; title: string; creator_id: string; workflow_id: string | null; saved_revision: string | null; binding_id: string | null; fence: string; sources: string; updated_at: string; created_at: string; inbox: number; audit: string | null }
+interface ProposalRow { id: string; doc_id: string; epoch: string; base_revision: string; author_id: string; workflow_id: string | null; operations: string; reason: string; sources: string; digest: string; state: string; applied_revision: string | null; diff: string; created_at: string; audit: string | null }
+interface TaskRow { id: string; principal_id: string; credential_hash: string; request_id: string; request: string; scope: string; action: string; state: string; cancel_requested: number; result: string | null; error: string | null; created_at: string; updated_at: string; progress: string | null }
 interface ArtifactRow { id: string; doc_id: string; epoch: string; revision: string; data: Uint8Array; digest: string; filename: string; creator_id: string; created_at: string }
 interface HandoffRow { id: string; artifact_id: string; sender_id: string; recipient_id: string; purpose: string; expires_at: string; grant_id: string; state: string; receipt: string | null; created_at: string }
 interface LeaseRow { doc_id: string; owner_session: string; fence: string; service_epoch: string; expires_at: string }
@@ -30,40 +34,71 @@ export interface ResourceBindingInput {
   consistency: 'conditional-write' | 'best-effort'
   needsReauthorization: boolean
 }
-export interface CoordinatorOptions { approvalPort?: ApprovalPort; now?: () => number }
+export interface CoordinatorOptions { approvalPort?: ApprovalPort; modelPort?: SystemModelPort; now?: () => number }
 
 const actions: Record<string, string> = {
   'documents.list': 'document:read', 'documents.read': 'document:read',
   'documents.outline': 'document:read', 'documents.blocks': 'document:read',
   'documents.createDraft': 'document:create', 'proposals.create': 'proposal:create',
   'proposals.get': 'proposal:read', 'proposals.list': 'proposal:read',
+  'proposals.verify': 'audit:review',
+  'tasks.updateProgress': 'task:report_progress',
   'artifacts.export': 'artifact:export', 'artifacts.read': 'artifact:read',
+  'artifacts.materializeToManagedDir': 'artifact:materialize',
   'handoffs.create': 'artifact:share', 'handoffs.get': 'artifact:read',
   'handoffs.acknowledge': 'artifact:read',
+  'writing.generate': 'writing:generate',
 }
-const mutations = new Set(['documents.createDraft', 'proposals.create', 'artifacts.export', 'handoffs.create', 'handoffs.acknowledge'])
+const mutations = new Set([
+  'documents.createDraft',
+  'proposals.create',
+  'proposals.verify',
+  'artifacts.export',
+  'artifacts.materializeToManagedDir',
+  'handoffs.create',
+  'handoffs.acknowledge',
+  'writing.generate',
+])
+const AUDITOR_ALLOWED_ACTIONS = new Set(['audit:review', 'document:read', 'proposal:read', 'task:read', 'task:report_progress'])
 const authorActions = [...new Set([...Object.values(actions), 'task:read', 'grant:manage',
   'document:commit', 'proposal:approve', 'document:save', 'writer:manage'])]
 const finalStates = new Set(['succeeded', 'failed', 'cancelled'])
+const INQUIRY_COOLDOWN_MS = 180_000
 
 function parse<T>(text: string): T { return JSON.parse(text) as T }
 function object(value: unknown) { return value as Record<string, unknown> }
 function invalid(message = 'Invalid arguments.'): never { throw new ProtocolError('INVALID_ARGUMENT', message) }
 function denied(): never { throw new ProtocolError('PERMISSION_DENIED', 'This resource is not authorized.') }
+function sourceStrings(sources: unknown): string[] {
+  if (!Array.isArray(sources)) return []
+  return sources.flatMap(item => {
+    if (!item || typeof item !== 'object') return []
+    const entry = item as { uri?: unknown; label?: unknown }
+    return [
+      ...(typeof entry.uri === 'string' ? [entry.uri] : []),
+      ...(typeof entry.label === 'string' ? [entry.label] : []),
+    ]
+  })
+}
 
 /** The only owner of canonical drafts, credentials, proposals, durable tasks and commit decisions. */
 export class Coordinator {
+  private readonly stateDir: string
   private readonly db: Database
   private readonly clock: () => number
   private readonly approvalPort?: ApprovalPort
+  private readonly modelPort?: SystemModelPort
   private readonly serviceEpoch = randomUUID()
   private readonly timers = new Set<ReturnType<typeof setTimeout>>()
+  private readonly abortControllers = new Map<string, AbortController>()
   private closed = false
 
   constructor(stateDir: string, options: CoordinatorOptions = {}) {
+    this.stateDir = resolve(stateDir)
     this.clock = options.now ?? Date.now
     this.approvalPort = options.approvalPort
-    this.db = openStore(stateDir)
+    this.modelPort = options.modelPort
+    this.db = openStore(this.stateDir)
     this.atomic(() => {
       this.run('DELETE FROM writer_leases')
       for (const binding of this.rows<{ id: string; data: string }>('SELECT id,data FROM resource_bindings')) {
@@ -122,7 +157,10 @@ export class Coordinator {
     return !!parent && this.grantActive(parent, seen)
   }
   private matchingGrant(principal: Principal, action: string, scope: ResourceScope): GrantRow | undefined {
-    return this.rows<GrantRow>('SELECT * FROM grants WHERE principal_id=?', principal.id).find(grant => {
+    return this.matchingGrants(principal, action, scope)[0]
+  }
+  private matchingGrants(principal: Principal, action: string, scope: ResourceScope): GrantRow[] {
+    return this.rows<GrantRow>('SELECT * FROM grants WHERE principal_id=?', principal.id).filter(grant => {
       if (!this.grantActive(grant) || !parse<string[]>(grant.actions).includes(action)) return false
       const allowed = parse<ResourceScope>(grant.scope)
       return allowed.workspaceId === scope.workspaceId && ['docId', 'artifactId', 'workflowId', 'purpose']
@@ -207,19 +245,31 @@ export class Coordinator {
     const principal = this.authenticate(auth)
     const availableActions = new Set(this.rows<GrantRow>('SELECT * FROM grants WHERE principal_id=?', principal.id)
       .filter(grant => this.grantActive(grant)).flatMap(grant => parse<string[]>(grant.actions)))
+    const modelStatus = this.modelPort?.availabilitySync?.() ?? (this.modelPort
+      ? { available: true }
+      : { available: false, reason: 'The system model contract has not been verified.' })
     return { protocol: 'marktext-documents/1', schemaVersion: 1, principalId: principal.id, protocolSchema,
       grants: this.visibleGrants(principal),
-      limits, approval: { available: !!this.approvalPort, mode: this.approvalPort ? 'protected-host' : 'manual-preview' },
+      limits, approval: { available: !!this.approvalPort, mode: this.approvalPort ? this.approvalPort.mode ?? 'protected-host' : 'manual-preview' },
       capabilities: Object.entries(actions).filter(([id, action]) => availableActions.has(action)
         || (id === 'handoffs.get' && availableActions.has('artifact:share')))
-        .map(([id, action]) => ({ id, version: 1, available: true,
+        .map(([id, action]) => ({ id, version: 1,
+          available: id === 'writing.generate' ? modelStatus.available : true,
+          ...(id === 'writing.generate' && !modelStatus.available && modelStatus.reason ? { reason: modelStatus.reason } : {}),
           requiredAction: id === 'handoffs.get' ? 'artifact:read (recipient) / artifact:share (sender)' : action,
-          inputSchema: capabilitySchemas[id] })),
+          inputSchema: capabilitySchemas[id],
+          // A mutation's invoke returns only the receipt; its result is read from the durable task.
+          ...(mutations.has(id) ? { mode: 'task', outputSchema: taskReceiptSchema, resultSchema: capabilityResultSchemas[id] }
+            : { mode: 'read', outputSchema: capabilityResultSchemas[id] }) })),
       integrations: {
         notifications: { available: false, reason: 'Target notification delivery and click routing are not verified.' },
         systemFileHandoff: { available: false, reason: 'Target file-handle delivery is not verified.' },
         multipleWindows: { available: false, reason: 'SP-05 is not verified; one writer window is retained.' },
-        writingGenerate: { available: false, reason: 'The system model contract has not been verified.' },
+        writingGenerate: {
+          available: modelStatus.available,
+          ...(modelStatus.reason ? { reason: modelStatus.reason } : {}),
+          ...(modelStatus.models ? { models: modelStatus.models } : {}),
+        },
       } }
   }
   private visibleGrants(principal: Principal) {
@@ -266,6 +316,104 @@ export class Coordinator {
     this.authorize(principal, action, scope)
     return { artifact, document, scope }
   }
+  private hasActiveAuditorForScope(scope: ResourceScope): boolean {
+    return this.rows<GrantRow>('SELECT * FROM grants WHERE revoked=0').some(grant => {
+      if (!this.grantActive(grant)) return false
+      const owner = this.row<Principal>('SELECT * FROM principals WHERE id=?', grant.principal_id)
+      if (!owner || !owner.active || owner.kind !== 'agent') return false
+      if (!parse<string[]>(grant.actions).includes('audit:review')) return false
+      const auditorScope = parse<ResourceScope>(grant.scope)
+      return auditorScope.workspaceId === scope.workspaceId
+        && (!auditorScope.docId || auditorScope.docId === scope.docId)
+        && (!auditorScope.workflowId || auditorScope.workflowId === scope.workflowId)
+    })
+  }
+  private assertVerifiedAudit(rawAudit: string | null, label: string, scope?: ResourceScope, authorId?: string) {
+    if (!rawAudit) {
+      if (scope && authorId) {
+        const author = this.row<Principal>('SELECT * FROM principals WHERE id=?', authorId)
+        if (author?.kind === 'agent' && this.hasActiveAuditorForScope(scope)) {
+          throw new ProtocolError('AUDIT_NOT_PASSED', `This ${label} has not passed audit verification.`, false, { audit: { status: 'pending_audit' } })
+        }
+      }
+      return
+    }
+    const audit = parse<AuditMetadata>(rawAudit)
+    if (audit.status !== 'verified') {
+      throw new ProtocolError('AUDIT_NOT_PASSED', `This ${label} has not passed audit verification or is quarantined.`, false, { audit })
+    }
+  }
+  private assertQuarantineReadable(principal: Principal, rawAudit: string | null, scope: ResourceScope, label: string) {
+    if (!rawAudit || principal.kind === 'author') return
+    const audit = parse<AuditMetadata>(rawAudit)
+    if (audit.status === 'quarantined_injection' && !this.matchingGrant(principal, 'audit:review', scope)) {
+      throw new ProtocolError('AUDIT_NOT_PASSED', `This ${label} is quarantined due to prompt injection markers and cannot be read by non-auditor agents.`, false, { audit })
+    }
+  }
+  private requiresAuditForScope(principal: Principal, action: string, scope: ResourceScope): boolean {
+    const grants = this.matchingGrants(principal, action, scope)
+    if (grants.some(grant => parse<ResourceScope>(grant.scope).requireAudit === true)) return true
+    return this.hasActiveAuditorForScope(scope)
+  }
+  private effectiveMaxRetries(grants: GrantRow[]): number {
+    const limits = grants
+      .map(grant => parse<ResourceScope>(grant.scope).maxAuditRetries)
+      .filter((value): value is number => typeof value === 'number')
+    return limits.length ? Math.min(...limits) : 2
+  }
+  private countFlaggedAttempts(authorId: string, workspaceId: string, docId?: string, workflowId?: string | null): number {
+    const proposals = docId
+      ? this.rows<{ audit: string | null }>('SELECT audit FROM proposals WHERE author_id=? AND doc_id=?', authorId, docId)
+      : this.rows<{ audit: string | null }>(
+        'SELECT p.audit FROM proposals p JOIN documents d ON d.id=p.doc_id WHERE p.author_id=? AND d.workspace_id=?',
+        authorId,
+        workspaceId,
+      )
+    const drafts = workflowId
+      ? this.rows<{ audit: string | null }>('SELECT audit FROM documents WHERE creator_id=? AND workspace_id=? AND workflow_id=?', authorId, workspaceId, workflowId)
+      : this.rows<{ audit: string | null }>('SELECT audit FROM documents WHERE creator_id=? AND workspace_id=? AND inbox=1', authorId, workspaceId)
+    let count = 0
+    for (const row of [...proposals, ...drafts]) {
+      if (!row.audit) continue
+      const status = parse<AuditMetadata>(row.audit).status
+      if (status === 'flagged_drift' || status === 'quarantined_injection') count++
+    }
+    return count
+  }
+  private checkDraftGrantConstraints(principal: Principal, workspaceId: string, workflowId?: string) {
+    if (principal.kind !== 'agent') return
+    const scope: ResourceScope = { workspaceId, ...(workflowId ? { workflowId } : {}) }
+    const grants = this.matchingGrants(principal, 'document:create', scope)
+    if (!grants.length) denied()
+    const maxRetries = this.effectiveMaxRetries(grants)
+    const flagged = this.countFlaggedAttempts(principal.id, workspaceId, undefined, workflowId)
+    if (flagged >= maxRetries) {
+      throw new ProtocolError('GRANT_SCOPE_EXCEEDED', 'Maximum audit retry count exceeded; awaiting user intervention.')
+    }
+  }
+  private checkProposalGrantConstraints(principal: Principal, document: DocumentRow, operations: BlockOperation[], workflowId?: string) {
+    const scope = { ...this.documentScope(document), ...(workflowId ? { workflowId } : {}) }
+    const grants = this.matchingGrants(principal, 'proposal:create', scope)
+    if (!grants.length) denied()
+    const parsedScopes = grants.map(grant => parse<ResourceScope>(grant.scope))
+    const hasUnrestrictedBlockGrant = parsedScopes.some(s => !s.allowedBlockIds || s.allowedBlockIds.length === 0)
+    if (!hasUnrestrictedBlockGrant) {
+      const allowed = new Set(parsedScopes.flatMap(s => s.allowedBlockIds ?? []))
+      for (const op of operations) {
+        if (op.kind === 'insertAtStart' || !allowed.has(op.blockId)) {
+          throw new ProtocolError('GRANT_SCOPE_EXCEEDED', 'Operation targets a block outside the authorized allowedBlockIds.')
+        }
+      }
+    }
+    if (principal.kind === 'agent') {
+      const maxRetries = this.effectiveMaxRetries(grants)
+      const flagged = this.countFlaggedAttempts(principal.id, document.workspace_id, document.id, workflowId ?? document.workflow_id)
+      if (flagged >= maxRetries) {
+        throw new ProtocolError('GRANT_SCOPE_EXCEEDED', 'Maximum audit retry count exceeded; awaiting user intervention.')
+      }
+    }
+  }
+
   private requestAuthorization(principal: Principal, request: RequestEnvelope): { scope: ResourceScope; action: string } {
     const input = object(request.input)
     const action = actions[request.capability]
@@ -283,6 +431,25 @@ export class Coordinator {
         if (!visibleScope) denied()
         return { scope, action }
       }
+      this.authorize(principal, action, scope)
+    } else if (request.capability === 'proposals.verify') {
+      const targetKind = input.targetKind as 'draft' | 'proposal'
+      const targetId = input.targetId as string
+      if (targetKind === 'draft') {
+        const document = this.row<DocumentRow>('SELECT * FROM documents WHERE id=?', targetId)
+        if (!document) denied()
+        scope = this.documentScope(document)
+      } else {
+        const proposal = this.row<ProposalRow>('SELECT * FROM proposals WHERE id=?', targetId)
+        if (!proposal) denied()
+        const document = this.row<DocumentRow>('SELECT * FROM documents WHERE id=?', proposal.doc_id)!
+        scope = this.documentScope(document)
+      }
+      this.authorize(principal, action, scope)
+    } else if (request.capability === 'tasks.updateProgress') {
+      const task = this.row<TaskRow>('SELECT * FROM tasks WHERE id=?', input.taskId as string)
+      if (!task || task.principal_id !== principal.id) denied()
+      scope = parse<ResourceScope>(task.scope)
       this.authorize(principal, action, scope)
     } else if (input.document || input.base) {
       const ref = (input.document ?? input.base) as DocumentRef
@@ -310,7 +477,8 @@ export class Coordinator {
     return { scope, action }
   }
 
-  invoke(auth: string, value: unknown) {
+  /** `ephemeral` reads are for a trusted host that polls: they are authorized as usual but leave no record. */
+  invoke(auth: string, value: unknown, options: { ephemeral?: boolean } = {}) {
     const principal = this.authenticate(auth)
     const request = validateRequest(value)
     if (request.parentTaskId) this.requireTask(principal, request.parentTaskId)
@@ -320,6 +488,7 @@ export class Coordinator {
       return this.atomic(() => {
         this.authenticate(auth)
         this.requestAuthorization(principal, request)
+        if (options.ephemeral) return this.readRequest(principal, request)
         const old = this.row<IdempotencyRow>('SELECT * FROM idempotency_records WHERE principal_id=? AND request_id=?', principal.id, request.requestId)
         if (old) {
           if (old.digest !== requestDigest || !old.result) throw new ProtocolError('IDEMPOTENCY_MISMATCH', 'This requestId belongs to different arguments.')
@@ -343,7 +512,7 @@ export class Coordinator {
       if (queued.count >= 128) throw new ProtocolError('RATE_LIMITED', 'Too many pending tasks.', true)
       const taskId = randomUUID()
       const now = this.now()
-      this.run('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,0,NULL,NULL,?,?)', taskId, principal.id, digest(auth), request.requestId,
+      this.run('INSERT INTO tasks(id,principal_id,credential_hash,request_id,request,scope,action,state,cancel_requested,result,error,created_at,updated_at,progress) VALUES(?,?,?,?,?,?,?,?,0,NULL,NULL,?,?,NULL)', taskId, principal.id, digest(auth), request.requestId,
         canonical(request), canonical(authorization.scope), authorization.action, 'queued', now, now)
       this.run('INSERT INTO idempotency_records VALUES(?,?,?,?,NULL)', principal.id, request.requestId, requestDigest, taskId)
       this.event(principal.id, authorization.scope, 'task:read', 'task.queued', { taskId })
@@ -382,8 +551,10 @@ export class Coordinator {
     const error = task.error ? parse<{ code: string; message: string; retryable: boolean; details?: unknown }>(task.error) : undefined
     if (error?.details && !this.matchingGrant(principal, 'document:read', parse<ResourceScope>(task.scope))) delete error.details
     const capability = parse<{ capability: string }>(task.request).capability
+    const progress = task.progress ? parse<TaskProgress>(task.progress) : undefined
     return { ...this.receipt(task), capability, cancelRequested: !!task.cancel_requested,
       cancellable: capability !== 'author.save' && ['queued', 'running', 'awaiting_user'].includes(task.state), updatedAt: task.updated_at,
+      ...(progress ? { progress } : {}),
       ...(task.result ? { result: parse<unknown>(task.result) } : {}),
       ...(error ? { error } : {}) }
   }
@@ -396,6 +567,8 @@ export class Coordinator {
         throw new ProtocolError('TOO_LATE', 'The task has passed its cancellation point.')
       }
       if (task.state === 'failed' || task.state === 'cancelled') return this.getTask(auth, taskId)
+      this.abortControllers.get(taskId)?.abort()
+      this.abortControllers.delete(taskId)
       this.run("UPDATE tasks SET cancel_requested=1,state='cancelled',updated_at=? WHERE id=?", this.now(), taskId)
       this.event(principal.id, parse<ResourceScope>(task.scope), 'task:read', 'task.cancelled', { taskId })
       return this.getTask(auth, taskId)
@@ -404,11 +577,171 @@ export class Coordinator {
   private startTask(taskId: string) {
     const started = this.atomic(() => {
       const task = this.row<TaskRow>('SELECT * FROM tasks WHERE id=?', taskId)
-      if (!task || task.state !== 'queued') return false
+      if (!task || task.state !== 'queued') return undefined
+      const capability = parse<{ capability: string }>(task.request).capability
       this.run("UPDATE tasks SET state='running',updated_at=? WHERE id=?", this.now(), taskId)
-      return true
+      return capability
     })
-    if (started) this.defer(() => this.commitTask(taskId))
+    if (!started) return
+    if (started === 'writing.generate') void this.executeWritingTask(taskId)
+    else this.defer(() => this.commitTask(taskId))
+  }
+  private async executeWritingTask(taskId: string) {
+    this.abortControllers.get(taskId)?.abort()
+    const controller = new AbortController()
+    this.abortControllers.set(taskId, controller)
+    try {
+      const prepared = this.atomic(() => {
+        const task = this.row<TaskRow>('SELECT * FROM tasks WHERE id=?', taskId)
+        if (!task || task.state !== 'running' || task.cancel_requested) return undefined
+        const principal = this.authenticateHash(task.credential_hash)
+        const request = validateRequest(parse<unknown>(task.request))
+        if (request.deadlineAt && Date.parse(request.deadlineAt) <= this.clock()) {
+          throw new ProtocolError('DEADLINE_EXCEEDED', 'The task deadline elapsed before generation started.')
+        }
+        this.requestAuthorization(principal, request)
+        const input = object(request.input)
+        const ref = input.document as DocumentRef
+        const document = this.requireDocument(principal, ref, 'writing:generate')
+        const snapshot = this.snapshot(document, ref.revision)
+        const range = input.range as { start: number; end: number }
+        assertRange(snapshot.markdown, range.start, range.end)
+        const generationInput: ApprovedGenerationInput = {
+          generationId: randomUUID(),
+          purpose: input.purpose as WritingPurpose,
+          document: snapshot.document,
+          range: { start: range.start, end: range.end },
+          excerpt: snapshot.markdown.slice(range.start, range.end),
+          modelId: input.modelId as string,
+          ...(typeof input.instruction === 'string' ? { instruction: input.instruction } : {}),
+        }
+        return { principalId: principal.id, request, generationInput }
+      })
+      if (!prepared) return
+      if (!this.modelPort) {
+        throw new ProtocolError('MODEL_UNAVAILABLE', 'The system model contract (SP-04) has not been verified.')
+      }
+      const status = await this.modelPort.availability()
+      if (!status.available) {
+        throw new ProtocolError('MODEL_UNAVAILABLE', status.reason ?? 'The configured system model gateway is unavailable.')
+      }
+      if (status.models && status.models.length > 0 && !status.models.includes(prepared.generationInput.modelId)) {
+        throw new ProtocolError('INVALID_ARGUMENT', 'The requested model is not in the approved system model catalog.')
+      }
+      let generated = ''
+      for await (const event of this.modelPort.generate(prepared.generationInput, controller.signal)) {
+        if (this.closed || controller.signal.aborted) return
+        if (event.type === 'delta') {
+          generated += event.text
+          this.atomic(() => {
+            const current = this.row<TaskRow>('SELECT state,cancel_requested FROM tasks WHERE id=?', taskId)
+            if (!current || current.state !== 'running' || current.cancel_requested) {
+              controller.abort()
+              return
+            }
+            const now = this.now()
+            const progress: TaskProgress = {
+              currentActivity: `Generating ${prepared.generationInput.purpose} (${generated.length} chars)`,
+              updatedAt: now,
+            }
+            this.run('UPDATE tasks SET progress=?,updated_at=? WHERE id=?', canonical(progress), now, taskId)
+          })
+        } else if (event.type === 'done') {
+          generated = event.text
+        }
+      }
+      if (this.closed || controller.signal.aborted) return
+      this.atomic(() => {
+        const task = this.row<TaskRow>('SELECT * FROM tasks WHERE id=?', taskId)
+        if (!task || task.state !== 'running' || task.cancel_requested) return
+        const principal = this.authenticateHash(task.credential_hash)
+        const request = prepared.request
+        if (request.deadlineAt && Date.parse(request.deadlineAt) <= this.clock()) {
+          throw new ProtocolError('DEADLINE_EXCEEDED', 'The task deadline elapsed before commit.')
+        }
+        this.requestAuthorization(principal, request)
+        const flags = sanitizeContent([generated])
+        if (flags.length > 0) {
+          throw new ProtocolError('AUDIT_NOT_PASSED', 'Generated model output triggered prompt injection or privilege escalation quarantine.', false, { injectionEvidence: flags })
+        }
+        const { generationInput } = prepared
+        const document = this.requireDocument(principal, generationInput.document, 'writing:generate')
+        const snapshot = this.snapshot(document, generationInput.document.revision)
+        this.run("UPDATE tasks SET state='committing',updated_at=? WHERE id=?", this.now(), taskId)
+        let result: unknown
+        if (generationInput.purpose === 'summarize') {
+          result = {
+            kind: 'summary',
+            summary: generated,
+            base: snapshot.document,
+            range: generationInput.range,
+            modelId: generationInput.modelId,
+          }
+        } else {
+          this.current(principal, document, generationInput.document.revision)
+          this.authorize(principal, 'proposal:create', this.documentScope(document))
+          let operations: BlockOperation[]
+          if (!snapshot.blocks.length) {
+            operations = [{ kind: 'insertAtStart', markdown: generated }]
+          } else if (generationInput.purpose === 'continue') {
+            const anchor = snapshot.blocks.find(b => generationInput.range.end <= b.end) ?? snapshot.blocks[snapshot.blocks.length - 1]
+            operations = [{ kind: 'insertAfterBlock', blockId: anchor.blockId, markdown: generated.startsWith('\n') ? generated : `\n${generated}` }]
+          } else {
+            const overlapping = snapshot.blocks.filter(b => b.end > generationInput.range.start && b.start < Math.max(generationInput.range.end, generationInput.range.start + 1))
+            if (!overlapping.length) {
+              operations = [{ kind: 'replaceBlock', blockId: snapshot.blocks[0].blockId, markdown: generated }]
+            } else {
+              const first = overlapping[0]
+              const last = overlapping[overlapping.length - 1]
+              const prefix = generationInput.range.start > first.start ? snapshot.markdown.slice(first.start, generationInput.range.start) : ''
+              const suffix = generationInput.range.end < last.end ? snapshot.markdown.slice(generationInput.range.end, last.end) : ''
+              operations = [
+                { kind: 'replaceBlock', blockId: first.blockId, markdown: `${prefix}${generated}${suffix}` },
+                ...overlapping.slice(1).map(b => ({ kind: 'deleteBlock' as const, blockId: b.blockId })),
+              ]
+            }
+          }
+          this.checkProposalGrantConstraints(principal, document, operations, request.workflowId)
+          const created = this.createProposal(
+            principal,
+            snapshot,
+            operations,
+            `AI ${generationInput.purpose} (${generationInput.modelId})`,
+            [{ uri: `urn:marktext:ai:${generationInput.modelId}`, label: `Approved range ${generationInput.range.start}-${generationInput.range.end}` }],
+            request.workflowId,
+          )
+          result = {
+            kind: 'proposal',
+            proposalId: created.proposalId,
+            proposalDigest: created.proposalDigest,
+            state: created.state,
+            base: snapshot.document,
+            range: generationInput.range,
+            modelId: generationInput.modelId,
+            ...(created.audit ? { audit: created.audit } : {}),
+          }
+        }
+        this.run("UPDATE tasks SET state='succeeded',result=?,updated_at=? WHERE id=?", canonical(result), this.now(), taskId)
+        this.run('UPDATE idempotency_records SET result=? WHERE principal_id=? AND request_id=?', canonical(result), principal.id, request.requestId)
+        this.event(principal.id, parse<ResourceScope>(task.scope), 'task:read', 'task.succeeded', { taskId })
+      })
+    } catch (error) {
+      if (this.closed || controller.signal.aborted) return
+      this.atomic(() => {
+        const task = this.row<TaskRow>('SELECT * FROM tasks WHERE id=?', taskId)
+        if (!task || finalStates.has(task.state) || task.cancel_requested) return
+        const failure = error instanceof ProtocolError ? error : new ProtocolError('MODEL_ERROR', 'Model generation failed without modifying the document.')
+        this.run("UPDATE tasks SET state='failed',error=?,updated_at=? WHERE id=?", canonical({
+          code: failure.code,
+          message: failure.message,
+          retryable: failure.retryable,
+          ...(failure.details ? { details: failure.details } : {}),
+        }), this.now(), taskId)
+        this.event(task.principal_id, parse<ResourceScope>(task.scope), 'task:read', 'task.failed', { taskId, code: failure.code })
+      })
+    } finally {
+      this.abortControllers.delete(taskId)
+    }
   }
   private commitTask(taskId: string) {
     try {
@@ -443,12 +776,13 @@ export class Coordinator {
       case 'documents.list': {
         const all = this.rows<DocumentRow>('SELECT * FROM documents WHERE workspace_id=? ORDER BY id', input.workspaceId as string)
           .filter(document => (!request.workflowId || document.workflow_id === request.workflowId)
+            && (input.inbox === undefined || !!document.inbox === input.inbox)
             && !!this.matchingGrant(principal, 'document:read', this.documentScope(document)))
-        const context = canonical({ workspaceId: input.workspaceId, workflowId: request.workflowId })
+        const context = canonical({ workspaceId: input.workspaceId, workflowId: request.workflowId, inbox: input.inbox })
         const position = this.pagePosition(principal, 'documents', context, input.cursor as string | undefined)
         const limit = input.limit as number | undefined ?? 50
-        const documents = all.slice(position, position + limit).map(document => ({ document: this.documentRef(document), title: document.title,
-          savedRevision: document.saved_revision, creatorPrincipalId: document.creator_id, workflowId: document.workflow_id, updatedAt: document.updated_at }))
+        const documents = all.slice(position, position + limit).map(document => ({ document: this.documentRef(document),
+          savedRevision: document.saved_revision, ...this.provenance(document) }))
         return { documents, ...(position + limit < all.length ? { cursor: this.pageCursor(principal, 'documents', context, position + limit) } : {}) }
       }
       case 'documents.read':
@@ -456,6 +790,7 @@ export class Coordinator {
       case 'documents.blocks': {
         const ref = input.document as DocumentRef
         const document = this.requireDocument(principal, ref, 'document:read')
+        this.assertQuarantineReadable(principal, document.audit, this.documentScope(document), 'document')
         const snapshot = this.snapshot(document, ref.revision === 'latest' ? document.revision : ref.revision)
         if (request.capability === 'documents.outline') return { document: snapshot.document, outline: snapshot.outline }
         if (request.capability === 'documents.blocks') {
@@ -471,10 +806,16 @@ export class Coordinator {
         assertRange(snapshot.markdown, start, end)
         const sessions = this.rows<{ data: string }>('SELECT data FROM window_sessions WHERE doc_id=?', document.id)
         return { document: snapshot.document, markdown: snapshot.markdown.slice(start, end), range: { start, end },
+          ...this.provenance(document),
           savedRevision: document.saved_revision, saved: document.saved_revision === snapshot.document.revision,
           freshness: { committed: true, hasUnacknowledgedInput: sessions.some(session => !!parse<{ pendingInput?: boolean }>(session.data).pendingInput) } }
       }
-      case 'proposals.get': return this.proposalView(this.row<ProposalRow>('SELECT * FROM proposals WHERE id=?', input.proposalId as string)!)
+      case 'proposals.get': {
+        const proposal = this.row<ProposalRow>('SELECT * FROM proposals WHERE id=?', input.proposalId as string)!
+        const document = this.row<DocumentRow>('SELECT * FROM documents WHERE id=?', proposal.doc_id)!
+        this.assertQuarantineReadable(principal, proposal.audit, this.documentScope(document), 'proposal')
+        return this.proposalView(proposal)
+      }
       case 'proposals.list': {
         const document = this.requireDocument(principal, input.document as DocumentRef, 'proposal:read')
         const proposals = this.rows<ProposalRow>('SELECT * FROM proposals WHERE doc_id=? ORDER BY created_at DESC,id LIMIT 201', document.id)
@@ -483,6 +824,70 @@ export class Coordinator {
           const { operations, diff: _diff, ...summary } = view
           return { ...summary, operationCount: (operations as BlockOperation[]).length }
         }), truncated: proposals.length > 200 }
+      }
+      case 'tasks.updateProgress': {
+        const task = this.row<TaskRow>('SELECT * FROM tasks WHERE id=?', input.taskId as string)
+        if (!task || task.principal_id !== principal.id) denied()
+        const scope = parse<ResourceScope>(task.scope)
+        this.authorize(principal, 'task:report_progress', scope)
+        if (task.cancel_requested || finalStates.has(task.state)) {
+          throw new ProtocolError('TOO_LATE', 'Cannot update progress or open an inquiry on a finalized or cancelled task.')
+        }
+        const now = this.now()
+        const priorProgress = task.progress ? parse<TaskProgress>(task.progress) : undefined
+        const inquiry = input.inquiry as TaskInquiry | undefined
+        const progress: TaskProgress = {
+          currentActivity: input.currentActivity as string,
+          ...(input.completionRate !== undefined ? { completionRate: input.completionRate as number } : {}),
+          ...(input.activeIssues !== undefined ? { activeIssues: input.activeIssues as string[] } : {}),
+          ...(inquiry ? { inquiry } : {}),
+          ...(!inquiry && priorProgress?.inquiryResolution ? { inquiryResolution: priorProgress.inquiryResolution } : {}),
+          updatedAt: now,
+        }
+        let nextState = task.state
+        let cooldownActive = false
+        let batched = false
+        let shouldResume = false
+        if (inquiry) {
+          if (!finalStates.has(task.state)) nextState = 'awaiting_user'
+          const workflowKey = request.workflowId ?? scope.workflowId ?? scope.docId ?? scope.workspaceId
+          const windowStart = new Date(this.clock() - INQUIRY_COOLDOWN_MS).toISOString()
+          const recentInquiries = this.rows<{ data: string; created_at: string }>(
+            "SELECT data,created_at FROM events WHERE type='task.inquiry' AND created_at>?",
+            windowStart,
+          ).filter(event => parse<{ workflowKey?: string }>(event.data).workflowKey === workflowKey)
+          const unresolvedInWorkflow = this.rows<TaskRow>(
+            "SELECT id,scope,request FROM tasks WHERE state='awaiting_user' AND id!=?",
+            task.id,
+          ).some(other => {
+            const otherScope = parse<ResourceScope>(other.scope)
+            const otherReq = parse<{ workflowId?: string }>(other.request)
+            const otherKey = otherReq.workflowId ?? otherScope.workflowId ?? otherScope.docId ?? otherScope.workspaceId
+            return otherKey === workflowKey
+          })
+          if ((recentInquiries.length > 0 || unresolvedInWorkflow) && inquiry.category !== 'fatal_error') {
+            cooldownActive = true
+            batched = true
+          } else {
+            this.event(principal.id, scope, 'task:read', 'task.inquiry', {
+              taskId: task.id,
+              workflowKey,
+              category: inquiry.category,
+              summary: inquiry.summary,
+              options: inquiry.options,
+            })
+          }
+        } else if (task.state === 'awaiting_user') {
+          nextState = 'running'
+          shouldResume = true
+        }
+        this.run('UPDATE tasks SET state=?,progress=?,updated_at=? WHERE id=?', nextState, canonical(progress), now, task.id)
+        if (shouldResume) {
+          const capability = parse<{ capability: string }>(task.request).capability
+          if (capability === 'writing.generate') void this.executeWritingTask(task.id)
+          else this.defer(() => this.commitTask(task.id))
+        }
+        return { taskId: task.id, state: nextState, progress, cooldownActive, batched }
       }
       case 'artifacts.read': {
         const handoff = input.handoffId ? this.requireHandoff(principal, input.handoffId as string) : undefined
@@ -497,14 +902,25 @@ export class Coordinator {
       default: throw new ProtocolError('UNSUPPORTED_VERSION', 'This read capability is not supported.')
     }
   }
+  /** Provenance is fixed at creation; later commits change only updatedAt. */
+  private provenance(document: DocumentRow) {
+    const creator = this.row<Principal>('SELECT * FROM principals WHERE id=?', document.creator_id)!
+    const audit = document.audit ? parse<AuditMetadata>(document.audit) : undefined
+    return { title: document.title, creatorPrincipalId: document.creator_id, creatorName: creator.name,
+      workflowId: document.workflow_id, sources: parse<unknown>(document.sources), inbox: !!document.inbox,
+      createdAt: document.created_at || null, updatedAt: document.updated_at,
+      ...(audit ? { audit } : {}) }
+  }
   private proposalView(proposal: ProposalRow) {
     const document = this.row<DocumentRow>('SELECT * FROM documents WHERE id=?', proposal.doc_id)!
     const author = this.row<Principal>('SELECT * FROM principals WHERE id=?', proposal.author_id)!
+    const audit = proposal.audit ? parse<AuditMetadata>(proposal.audit) : undefined
     return { proposalId: proposal.id, base: { ...this.documentRef(document), documentEpoch: proposal.epoch, revision: proposal.base_revision },
       authorPrincipalId: proposal.author_id, authorName: author.name, workflowId: proposal.workflow_id,
       operations: parse<unknown>(proposal.operations), reason: proposal.reason, sources: parse<unknown>(proposal.sources),
       proposalDigest: proposal.digest, state: proposal.state, appliedRevision: proposal.applied_revision,
-      diff: parse<unknown>(proposal.diff), createdAt: proposal.created_at }
+      diff: parse<unknown>(proposal.diff), createdAt: proposal.created_at,
+      ...(audit ? { audit } : {}) }
   }
   private artifactView(artifact: ArtifactRow, document: DocumentRow) {
     return { artifactId: artifact.id, document: { ...this.documentRef(document), documentEpoch: artifact.epoch, revision: artifact.revision },
@@ -530,20 +946,90 @@ export class Coordinator {
     const input = object(request.input)
     switch (request.capability) {
       case 'documents.createDraft': {
+        this.checkDraftGrantConstraints(principal, input.workspaceId as string, request.workflowId)
         const snapshot = this.createDocument(principal, input.workspaceId as string, input.title as string, input.markdown as string,
-          request.workflowId, input.sources)
-        return { document: snapshot.document, inbox: true }
+          request.workflowId, input.sources, true)
+        const stored = this.row<DocumentRow>('SELECT * FROM documents WHERE id=?', snapshot.document.docId)!
+        const audit = stored.audit ? parse<AuditMetadata>(stored.audit) : undefined
+        return { document: snapshot.document, inbox: true, ...(audit ? { audit } : {}) }
       }
       case 'proposals.create': {
         const base = input.base as DocumentRef
         const document = this.requireDocument(principal, base, 'proposal:create')
         this.current(principal, document, base.revision)
-        return this.createProposal(principal, this.snapshot(document, base.revision), input.operations as BlockOperation[],
+        const operations = input.operations as BlockOperation[]
+        this.checkProposalGrantConstraints(principal, document, operations, request.workflowId)
+        return this.createProposal(principal, this.snapshot(document, base.revision), operations,
           input.reason as string, input.sources, request.workflowId)
+      }
+      case 'proposals.verify': {
+        const targetKind = input.targetKind as 'draft' | 'proposal'
+        const targetId = input.targetId as string
+        const outcome = input.outcome as 'verified' | 'flagged_drift' | 'quarantined_injection'
+        const now = this.now()
+        let document: DocumentRow
+        let authorId: string
+        let workflowId: string | null
+        let existingAudit: AuditMetadata | undefined
+        if (targetKind === 'draft') {
+          const found = this.row<DocumentRow>('SELECT * FROM documents WHERE id=?', targetId)
+          if (!found) denied()
+          document = found
+          authorId = found.creator_id
+          workflowId = found.workflow_id
+          existingAudit = found.audit ? parse<AuditMetadata>(found.audit) : undefined
+        } else {
+          const proposal = this.row<ProposalRow>('SELECT * FROM proposals WHERE id=?', targetId)
+          if (!proposal) denied()
+          document = this.row<DocumentRow>('SELECT * FROM documents WHERE id=?', proposal.doc_id)!
+          authorId = proposal.author_id
+          workflowId = proposal.workflow_id ?? document.workflow_id
+          existingAudit = proposal.audit ? parse<AuditMetadata>(proposal.audit) : undefined
+        }
+        const scope = this.documentScope(document)
+        this.authorize(principal, 'audit:review', scope)
+        if (existingAudit?.status === 'quarantined_injection' && outcome !== 'quarantined_injection') {
+          throw new ProtocolError('AUDIT_NOT_PASSED', 'Static injection quarantine cannot be downgraded or cleared by an auditor.', false, { audit: existingAudit })
+        }
+        const injectionEvidence = (input.injectionEvidence as string[] | undefined) ?? existingAudit?.injectionEvidence
+        const audit: AuditMetadata = {
+          status: outcome,
+          auditorPrincipalId: principal.id,
+          auditedAt: now,
+          ...(input.completionRate !== undefined ? { completionRate: input.completionRate as number } : {}),
+          ...(input.missingCriteria !== undefined ? { missingCriteria: input.missingCriteria as string[] } : {}),
+          ...(input.correctionHint !== undefined ? { correctionHint: input.correctionHint as string } : {}),
+          ...(injectionEvidence && injectionEvidence.length ? { injectionEvidence } : {}),
+        }
+        if (targetKind === 'draft') {
+          this.run('UPDATE documents SET audit=?,updated_at=? WHERE id=?', canonical(audit), now, targetId)
+        } else {
+          this.run('UPDATE proposals SET audit=? WHERE id=?', canonical(audit), targetId)
+        }
+        let circuitBroken = false
+        if (outcome === 'flagged_drift' || outcome === 'quarantined_injection') {
+          const author = this.row<Principal>('SELECT * FROM principals WHERE id=?', authorId)
+          const authorGrants = author
+            ? this.rows<GrantRow>('SELECT * FROM grants WHERE principal_id=? AND revoked=0', author.id).filter(grant => this.grantActive(grant))
+            : []
+          const maxRetries = this.effectiveMaxRetries(authorGrants)
+          const flaggedCount = this.countFlaggedAttempts(authorId, document.workspace_id, document.id, workflowId)
+          if (flaggedCount >= maxRetries || outcome === 'quarantined_injection') {
+            circuitBroken = true
+            this.run(
+              "UPDATE tasks SET state='awaiting_user',updated_at=? WHERE principal_id=? AND state IN ('queued','running')",
+              now,
+              authorId,
+            )
+          }
+        }
+        this.event(principal.id, scope, 'proposal:read', 'audit.verdict', { targetKind, targetId, outcome, circuitBroken })
+        return { targetKind, targetId, audit, circuitBroken }
       }
       case 'artifacts.export': {
         const ref = input.document as DocumentRef
         const document = this.requireDocument(principal, ref, 'artifact:export')
+        this.assertVerifiedAudit(document.audit, 'document', this.documentScope(document), document.creator_id)
         const snapshot = this.snapshot(document, ref.revision)
         const bytes = new TextEncoder().encode(snapshot.rawText)
         const artifactId = randomUUID()
@@ -555,6 +1041,84 @@ export class Coordinator {
         this.event(principal.id, this.documentScope(document), 'artifact:export', 'artifact.exported', { artifactId, document: ref })
         return this.artifactView(this.row<ArtifactRow>('SELECT * FROM artifacts WHERE id=?', artifactId)!, document)
       }
+      case 'artifacts.materializeToManagedDir': {
+        const { artifact, document, scope } = this.artifact(principal, input.artifactId as string, 'artifact:materialize')
+        this.assertVerifiedAudit(document.audit, 'document', scope, document.creator_id)
+        const relativePath = input.relativePath as string
+        if (
+          !relativePath
+          || relativePath.includes('\0')
+          || relativePath.startsWith('/')
+          || relativePath.startsWith('\\')
+          || /^[A-Za-z]:/.test(relativePath)
+          || !/\.(md|markdown|txt)$/i.test(relativePath)
+        ) {
+          throw new ProtocolError('MANAGED_PATH_VIOLATION', 'Target path must be a relative Markdown or text file inside the managed sandbox directory.')
+        }
+        const segments = relativePath.split(/[\\/]/)
+        if (segments.some(segment => !segment || segment === '.' || segment === '..')) {
+          throw new ProtocolError('MANAGED_PATH_VIOLATION', 'Target path cannot contain parent directory traversal segments.')
+        }
+        const realStateDir = realpathSync(this.stateDir)
+        const managedRoot = join(realStateDir, 'managed_workspace')
+        if (existsSync(managedRoot)) {
+          if (lstatSync(managedRoot).isSymbolicLink()) {
+            throw new ProtocolError('MANAGED_PATH_VIOLATION', 'Symbolic links are forbidden for the managed sandbox root.')
+          }
+        } else {
+          mkdirSync(managedRoot, { recursive: true, mode: 0o700 })
+        }
+        const realManagedRoot = realpathSync(managedRoot)
+        if (realManagedRoot !== managedRoot || !realManagedRoot.startsWith(realStateDir + sep)) {
+          throw new ProtocolError('MANAGED_PATH_VIOLATION', 'Managed sandbox root escapes the service state directory.')
+        }
+        const targetPath = resolve(realManagedRoot, ...segments)
+        if (!targetPath.startsWith(realManagedRoot + sep)) {
+          throw new ProtocolError('MANAGED_PATH_VIOLATION', 'Target path escapes the managed sandbox directory.')
+        }
+        let currentDir = realManagedRoot
+        for (const segment of segments.slice(0, -1)) {
+          currentDir = join(currentDir, segment)
+          if (existsSync(currentDir)) {
+            if (lstatSync(currentDir).isSymbolicLink()) {
+              throw new ProtocolError('MANAGED_PATH_VIOLATION', 'Symbolic links are forbidden inside the managed sandbox directory.')
+            }
+          } else {
+            mkdirSync(currentDir, { mode: 0o700 })
+          }
+        }
+        if (existsSync(targetPath) && lstatSync(targetPath).isSymbolicLink()) {
+          throw new ProtocolError('MANAGED_PATH_VIOLATION', 'Cannot overwrite a symbolic link in the managed sandbox directory.')
+        }
+        const tmpPath = join(dirname(targetPath), `.tmp-${randomUUID()}`)
+        const fd = openSync(tmpPath, 'w', 0o600)
+        try {
+          writeFileSync(fd, artifact.data)
+          fsyncSync(fd)
+        } finally {
+          closeSync(fd)
+        }
+        try {
+          renameSync(tmpPath, targetPath)
+        } catch (error) {
+          try { unlinkSync(tmpPath) } catch { /* ignore cleanup error */ }
+          throw error
+        }
+        const materializedAt = this.now()
+        this.event(principal.id, scope, 'artifact:materialize', 'artifact.materialized', {
+          artifactId: artifact.id,
+          relativePath: segments.join('/'),
+          byteLength: artifact.data.byteLength,
+          digest: artifact.digest,
+        })
+        return {
+          artifactId: artifact.id,
+          relativePath: segments.join('/'),
+          byteLength: artifact.data.byteLength,
+          digest: artifact.digest,
+          materializedAt,
+        }
+      }
       case 'handoffs.create': {
         const { artifact, scope } = this.artifact(principal, input.artifactId as string, 'artifact:share', input.purpose as string)
         const grant = this.authorize(principal, 'artifact:share', scope)
@@ -562,6 +1126,11 @@ export class Coordinator {
         if (grant.delegation_depth < 1 || expiresAt > grant.expires_at || expiresAt <= this.now()) denied()
         const recipient = this.row<Principal>('SELECT * FROM principals WHERE id=? AND active=1', input.recipientPrincipalId as string)
         if (!recipient) denied()
+        const recipientActions = new Set(this.rows<GrantRow>('SELECT * FROM grants WHERE principal_id=?', recipient.id)
+          .filter(g => this.grantActive(g)).flatMap(g => parse<string[]>(g.actions)))
+        if (recipientActions.has('audit:review') && !AUDITOR_ALLOWED_ACTIONS.has('artifact:read')) {
+          denied()
+        }
         const handoffId = randomUUID()
         const childGrantId = this.insertGrant({ principalId: recipient.id, scope: { ...scope, purpose: input.purpose as string },
           actions: ['artifact:read'], expiresAt, delegationDepth: grant.delegation_depth - 1 }, grant.id)
@@ -590,13 +1159,28 @@ export class Coordinator {
     }
   }
 
-  private createDocument(principal: Principal, workspaceId: string, title: string, rawText: string, workflowId?: string, sources: unknown = []) {
+  private createDocument(principal: Principal, workspaceId: string, title: string, rawText: string, workflowId?: string, sources: unknown = [], inbox = false) {
     const ref: DocumentRef = { workspaceId, docId: randomUUID(), documentEpoch: randomUUID(), revision: '0' }
     const snapshot = createSnapshot(ref, rawText)
-    this.run('INSERT INTO documents VALUES(?,?,?,?,?,?,?,NULL,NULL,?,?,?)', ref.docId, workspaceId, ref.documentEpoch, ref.revision,
-      title, principal.id, workflowId ?? null, '0', canonical(sources), this.now())
+    const createdAt = this.now()
+    let audit: AuditMetadata | undefined
+    if (inbox) {
+      const flags = sanitizeContent([title, rawText], sourceStrings(sources))
+      const scope: ResourceScope = { workspaceId, ...(workflowId ? { workflowId } : {}) }
+      if (flags.length > 0) {
+        audit = { status: 'quarantined_injection', injectionEvidence: flags, auditedAt: createdAt }
+      } else if (principal.kind === 'agent' && this.requiresAuditForScope(principal, 'document:create', scope)) {
+        audit = { status: 'pending_audit' }
+      }
+    }
+    this.run('INSERT INTO documents(id,workspace_id,epoch,revision,title,creator_id,workflow_id,saved_revision,binding_id,fence,sources,updated_at,created_at,inbox,audit) VALUES(?,?,?,?,?,?,?,NULL,NULL,?,?,?,?,?,?)', ref.docId, workspaceId, ref.documentEpoch, ref.revision,
+      title, principal.id, workflowId ?? null, '0', canonical(sources), createdAt, createdAt, inbox ? 1 : 0, audit ? canonical(audit) : null)
     this.storeSnapshot(snapshot)
-    this.event(principal.id, { workspaceId, docId: ref.docId, ...(workflowId ? { workflowId } : {}) }, 'document:read', 'document.created', { document: ref })
+    if (audit?.status !== 'quarantined_injection') {
+      this.event(principal.id, { workspaceId, docId: ref.docId, ...(workflowId ? { workflowId } : {}) }, 'document:read', 'document.created', { document: ref, inbox })
+    } else {
+      this.event(principal.id, { workspaceId, docId: ref.docId, ...(workflowId ? { workflowId } : {}) }, 'document:read', 'document.quarantined', { document: ref, injectionEvidence: audit.injectionEvidence })
+    }
     return snapshot
   }
   private storeSnapshot(snapshot: DocumentSnapshot) {
@@ -609,12 +1193,27 @@ export class Coordinator {
     const content = { base: snapshot.document, operations, authorPrincipalId: principal.id, reason, sources, workflowId }
     const proposalDigest = digest(content)
     const diff = { before: snapshot.markdown, after: applied.markdown, changes: applied.changes }
-    this.run('INSERT INTO proposals VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL,?,?)', proposalId, snapshot.document.docId,
-      snapshot.document.documentEpoch, snapshot.document.revision, principal.id, workflowId ?? null, canonical(operations), reason,
-      canonical(sources), proposalDigest, 'pending_review', canonical(diff), this.now())
+    const createdAt = this.now()
     const document = this.row<DocumentRow>('SELECT * FROM documents WHERE id=?', snapshot.document.docId)!
-    this.event(principal.id, this.documentScope(document), 'proposal:read', 'proposal.created', { proposalId, base: snapshot.document })
-    return { proposalId, base: snapshot.document, proposalDigest, state: 'pending_review' }
+    const scope = { ...this.documentScope(document), ...(workflowId ? { workflowId } : {}) }
+    let audit: AuditMetadata | undefined
+    if (quota === 'proposal') {
+      const flags = sanitizeContent([reason, ...operations.map(op => 'markdown' in op ? op.markdown : '')], sourceStrings(sources))
+      if (flags.length > 0) {
+        audit = { status: 'quarantined_injection', injectionEvidence: flags, auditedAt: createdAt }
+      } else if (principal.kind === 'agent' && this.requiresAuditForScope(principal, 'proposal:create', scope)) {
+        audit = { status: 'pending_audit' }
+      }
+    }
+    this.run('INSERT INTO proposals(id,doc_id,epoch,base_revision,author_id,workflow_id,operations,reason,sources,digest,state,applied_revision,diff,created_at,audit) VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL,?,?,?)', proposalId, snapshot.document.docId,
+      snapshot.document.documentEpoch, snapshot.document.revision, principal.id, workflowId ?? null, canonical(operations), reason,
+      canonical(sources), proposalDigest, 'pending_review', canonical(diff), createdAt, audit ? canonical(audit) : null)
+    if (audit?.status !== 'quarantined_injection') {
+      this.event(principal.id, this.documentScope(document), 'proposal:read', 'proposal.created', { proposalId, base: snapshot.document })
+    } else {
+      this.event(principal.id, this.documentScope(document), 'proposal:read', 'proposal.quarantined', { proposalId, base: snapshot.document, injectionEvidence: audit.injectionEvidence })
+    }
+    return { proposalId, base: snapshot.document, proposalDigest, state: 'pending_review', ...(audit ? { audit } : {}) }
   }
   private event(principalId: string | null, scope: ResourceScope, action: string, type: string, data: unknown) {
     this.run('INSERT INTO events(id,principal_id,scope,action,type,data,created_at) VALUES(?,?,?,?,?,?,?)', randomUUID(),
@@ -668,8 +1267,80 @@ export class Coordinator {
     if (this.closed) return
     for (const timer of this.timers) clearTimeout(timer)
     this.timers.clear()
+    for (const controller of this.abortControllers.values()) controller.abort()
+    this.abortControllers.clear()
     this.closed = true
     this.db.close()
+  }
+
+  listWorkspaceTasks(auth: string, workspaceId: string) {
+    this.author(auth, 'task:read', { workspaceId })
+    return this.rows<TaskRow>('SELECT * FROM tasks ORDER BY updated_at DESC,id LIMIT 100').flatMap(task => {
+      const scope = parse<ResourceScope>(task.scope)
+      if (scope.workspaceId !== workspaceId) return []
+      const req = parse<{ capability: string; workflowId?: string }>(task.request)
+      if (req.capability.startsWith('author.')) return []
+      const owner = this.row<Principal>('SELECT * FROM principals WHERE id=?', task.principal_id)
+      const progress = task.progress ? parse<TaskProgress>(task.progress) : undefined
+      const error = task.error ? parse<{ code: string; message: string; retryable: boolean }>(task.error) : undefined
+      return [{
+        taskId: task.id,
+        requestId: task.request_id,
+        principalId: task.principal_id,
+        principalName: owner?.name ?? task.principal_id,
+        capability: req.capability,
+        workflowId: req.workflowId ?? scope.workflowId ?? null,
+        docId: scope.docId ?? null,
+        state: task.state,
+        cancelRequested: !!task.cancel_requested,
+        createdAt: task.created_at,
+        updatedAt: task.updated_at,
+        ...(progress ? { progress } : {}),
+        ...(error ? { error } : {}),
+      }]
+    })
+  }
+
+  resolveTaskInquiry(auth: string, input: AuthorInput & { workspaceId: string; taskId: string; optionId: string }) {
+    let resumeCapability: string | undefined
+    const resolved = this.hostCommand(auth, 'task:resolveInquiry', input, { workspaceId: input.workspaceId }, 'grant:manage', principal => {
+      const task = this.row<TaskRow>('SELECT * FROM tasks WHERE id=?', input.taskId)
+      if (!task) denied()
+      const scope = parse<ResourceScope>(task.scope)
+      if (scope.workspaceId !== input.workspaceId) denied()
+      if (task.state !== 'awaiting_user' || task.cancel_requested) {
+        throw new ProtocolError('REVISION_CONFLICT', 'This task is no longer awaiting a user decision.')
+      }
+      const prior = task.progress ? parse<TaskProgress>(task.progress) : undefined
+      if (prior?.inquiry && !prior.inquiry.options.some(opt => opt.optionId === input.optionId)) {
+        invalid('The selected inquiry option does not belong to this task.')
+      }
+      const now = this.now()
+      const resolution: InquiryResolution = {
+        optionId: input.optionId,
+        resolvedBy: principal.id,
+        resolvedAt: now,
+      }
+      const nextProgress: TaskProgress = {
+        currentActivity: prior?.currentActivity ?? 'User decision received; resuming task',
+        ...(prior?.completionRate !== undefined ? { completionRate: prior.completionRate } : {}),
+        ...(prior?.activeIssues ? { activeIssues: prior.activeIssues } : {}),
+        ...(prior?.inquiry ? { inquiry: prior.inquiry } : {}),
+        inquiryResolution: resolution,
+        updatedAt: now,
+      }
+      this.run("UPDATE tasks SET state='running',progress=?,updated_at=? WHERE id=?", canonical(nextProgress), now, task.id)
+      this.event(task.principal_id, scope, 'task:read', 'task.inquiry_resolved', {
+        taskId: task.id,
+        optionId: input.optionId,
+        resolvedAt: now,
+      })
+      resumeCapability = parse<{ capability: string }>(task.request).capability
+      return { taskId: task.id, state: 'running' as const, inquiryResolution: resolution }
+    })
+    if (resumeCapability === 'writing.generate') void this.executeWritingTask(input.taskId)
+    else if (resumeCapability) this.defer(() => this.commitTask(input.taskId))
+    return resolved
   }
 
   // Protected host commands are deliberately absent from the worker's public method allowlist.
@@ -709,8 +1380,37 @@ export class Coordinator {
         this.checkGrantInput(owner, { ...grant, principalId })
         return this.insertGrant({ ...grant, principalId })
       })
-      this.run("UPDATE pairings SET state='approved',principal_id=? WHERE id=?", principalId, pairing.id)
+      // The caller polls for the decision; it gets a fresh window to claim from the moment of approval.
+      this.run("UPDATE pairings SET state='approved',principal_id=?,expires_at=? WHERE id=?", principalId, this.expiry(10 * 60_000), pairing.id)
       return { principalId, grantIds }
+    })
+  }
+
+  /** Names are caller-supplied and unverified; the host shows them as text only. */
+  listPairings(auth: string, workspaceId: string) {
+    this.author(auth, 'grant:manage', { workspaceId })
+    return this.rows<{ id: string; name: string; expires_at: string }>(
+      "SELECT id,name,expires_at FROM pairings WHERE state='pending' AND expires_at>? ORDER BY expires_at,id", this.now())
+      .map(pairing => ({ pairingId: pairing.id, name: pairing.name, expiresAt: pairing.expires_at }))
+  }
+
+  rejectPairing(auth: string, input: AuthorInput & { pairingId: string; workspaceId: string }) {
+    return this.hostCommand(auth, 'pairing:reject', input, { workspaceId: input.workspaceId }, 'grant:manage', () => {
+      const pairing = this.row<{ id: string; state: string }>('SELECT id,state FROM pairings WHERE id=?', input.pairingId)
+      if (!pairing || pairing.state !== 'pending') invalid('This pairing cannot be rejected.')
+      this.run("UPDATE pairings SET state='rejected',claim_hash='' WHERE id=?", pairing.id)
+      return { pairingId: pairing.id, state: 'rejected' }
+    })
+  }
+
+  listPrincipals(auth: string, workspaceId: string) {
+    this.author(auth, 'grant:manage', { workspaceId })
+    return this.rows<Principal>("SELECT * FROM principals WHERE kind='agent' ORDER BY name,id").flatMap(principal => {
+      const grants = this.rows<GrantRow>('SELECT * FROM grants WHERE principal_id=? ORDER BY expires_at,id', principal.id)
+        .filter(grant => parse<ResourceScope>(grant.scope).workspaceId === workspaceId)
+        .map(grant => ({ grantId: grant.id, scope: parse<ResourceScope>(grant.scope), actions: parse<string[]>(grant.actions),
+          expiresAt: grant.expires_at, active: this.grantActive(grant), delegationDepth: grant.delegation_depth, delegated: !!grant.parent_id }))
+      return grants.length ? [{ principalId: principal.id, name: principal.name, active: !!principal.active, grants }] : []
     })
   }
 
@@ -718,11 +1418,29 @@ export class Coordinator {
     if (!input.scope?.workspaceId || !input.actions.length || typeof input.expiresAt !== 'string'
       || !Number.isFinite(Date.parse(input.expiresAt)) || Date.parse(input.expiresAt) <= this.clock()
       || !Number.isSafeInteger(input.delegationDepth ?? 0) || (input.delegationDepth ?? 0) < 0) invalid('Invalid grant.')
+    if (input.scope.allowedBlockIds !== undefined && (!Array.isArray(input.scope.allowedBlockIds)
+      || !input.scope.allowedBlockIds.length || input.scope.allowedBlockIds.some(id => typeof id !== 'string' || !id))) {
+      invalid('Invalid allowedBlockIds constraint.')
+    }
+    if (input.scope.maxAuditRetries !== undefined && (!Number.isSafeInteger(input.scope.maxAuditRetries)
+      || input.scope.maxAuditRetries < 1 || input.scope.maxAuditRetries > 10)) {
+      invalid('Invalid maxAuditRetries constraint.')
+    }
     this.authorize(owner, 'grant:manage', input.scope)
+    const existingActions = new Set(this.rows<GrantRow>('SELECT * FROM grants WHERE principal_id=?', input.principalId)
+      .filter(grant => this.grantActive(grant)).flatMap(grant => parse<string[]>(grant.actions)))
+    const combinedActions = new Set([...existingActions, ...input.actions])
+    if (combinedActions.has('audit:review')) {
+      for (const action of combinedActions) {
+        if (!AUDITOR_ALLOWED_ACTIONS.has(action)) denied()
+      }
+    }
     for (const action of input.actions) {
       if (!authorActions.includes(action) || ['grant:manage', 'document:commit', 'proposal:approve', 'document:save', 'writer:manage'].includes(action)) denied()
-      const upper = this.authorize(owner, action, input.scope)
-      if (Date.parse(input.expiresAt) > Date.parse(upper.expires_at) || (input.delegationDepth ?? 0) > upper.delegation_depth) denied()
+      // An owner may hold overlapping grants (a renewed session); any one of them may cover the new grant.
+      const covered = this.matchingGrants(owner, action, input.scope).some(upper =>
+        Date.parse(input.expiresAt) <= Date.parse(upper.expires_at) && (input.delegationDepth ?? 0) <= upper.delegation_depth)
+      if (!covered) denied()
     }
   }
 
@@ -805,6 +1523,61 @@ export class Coordinator {
       const bindingId = this.storeBinding(input.document, input.binding, input.windowSessionId)
       this.run('UPDATE documents SET binding_id=?,saved_revision=CASE WHEN binding_id=? THEN saved_revision ELSE NULL END WHERE id=?', bindingId, bindingId, document.id)
       return { bindingId, document: this.documentRef(document) }
+    })
+  }
+
+  getWriterStatus(auth: string, document: DocumentRef, windowSessionId?: string) {
+    const principal = this.author(auth, 'document:read', { workspaceId: document.workspaceId, docId: document.docId })
+    const stored = this.requireDocument(principal, document, 'document:read')
+    const lease = this.row<LeaseRow>('SELECT * FROM writer_leases WHERE doc_id=?', stored.id)
+    const active = !!lease && lease.service_epoch === this.serviceEpoch && lease.expires_at > this.now()
+    const ownerSession = active ? lease!.owner_session : null
+    const sessionRow = ownerSession ? this.row<{ data: string }>('SELECT data FROM window_sessions WHERE id=?', ownerSession) : undefined
+    const hasPendingInput = sessionRow ? !!parse<{ pendingInput?: boolean }>(sessionRow.data).pendingInput : false
+    return {
+      document: this.documentRef(stored),
+      hasActiveLease: active,
+      ownerSessionId: ownerSession,
+      ownedByCaller: !!windowSessionId && ownerSession === windowSessionId,
+      writerFence: active ? lease!.fence : stored.fence,
+      expiresAt: active ? lease!.expires_at : null,
+      hasPendingInput,
+    }
+  }
+
+  takeoverWriter(auth: string, input: AuthorInput & { document: DocumentRef; windowSessionId: string }) {
+    return this.hostCommand(auth, 'writer:takeover', input, { workspaceId: input.document.workspaceId, docId: input.document.docId }, 'writer:manage', principal => {
+      if (!input.windowSessionId || input.windowSessionId.length > 128) invalid('A window session is required.')
+      const document = this.requireDocument(principal, input.document, 'writer:manage')
+      this.current(principal, document, input.document.revision)
+      const session = this.row<{ principal_id: string; doc_id: string }>('SELECT * FROM window_sessions WHERE id=?', input.windowSessionId)
+      if (session && (session.principal_id !== principal.id || session.doc_id !== document.id)) denied()
+      const old = this.row<LeaseRow>('SELECT * FROM writer_leases WHERE doc_id=?', document.id)
+      if (old && old.service_epoch === this.serviceEpoch && old.expires_at > this.now() && old.owner_session !== input.windowSessionId) {
+        const oldSession = this.row<{ data: string }>('SELECT data FROM window_sessions WHERE id=?', old.owner_session)
+        if (oldSession && parse<{ pendingInput?: boolean }>(oldSession.data).pendingInput) {
+          throw new ProtocolError('EDITOR_BUSY', 'The active writer window still has unsynchronized input; wait for synchronization or lease expiry before taking over.')
+        }
+      }
+      const fence = old && old.owner_session === input.windowSessionId && old.service_epoch === this.serviceEpoch && old.expires_at > this.now()
+        ? old.fence
+        : nextRevision(document.fence)
+      const expiresAt = this.expiry(10_000)
+      this.run('UPDATE documents SET fence=? WHERE id=?', fence, document.id)
+      this.run('INSERT INTO writer_leases VALUES(?,?,?,?,?) ON CONFLICT(doc_id) DO UPDATE SET owner_session=excluded.owner_session,fence=excluded.fence,service_epoch=excluded.service_epoch,expires_at=excluded.expires_at', document.id, input.windowSessionId, fence, this.serviceEpoch, expiresAt)
+      this.run('INSERT INTO window_sessions VALUES(?,?,?,?) ON CONFLICT(id) DO NOTHING', input.windowSessionId, principal.id, document.id,
+        canonical({ pendingInput: false, localOpSeq: 0, acknowledgedRevision: document.revision }))
+      this.event(principal.id, this.documentScope(document), 'document:read', 'writer.taken_over', {
+        document: this.documentRef(document),
+        writerFence: fence,
+      })
+      return {
+        windowSessionId: input.windowSessionId,
+        writerFence: fence,
+        serviceEpoch: this.serviceEpoch,
+        expiresAt,
+        document: this.documentRef(document),
+      }
     })
   }
 
@@ -913,6 +1686,7 @@ export class Coordinator {
     try {
       return this.hostCommand(auth, 'document:commit', input, { workspaceId: input.document.workspaceId, docId: input.document.docId }, 'document:commit', principal => {
         const document = this.requireDocument(principal, input.document, 'document:commit')
+        this.assertVerifiedAudit(document.audit, 'document', this.documentScope(document), document.creator_id)
         this.checkLease(principal, document, input)
         this.current(principal, document, input.document.revision)
         if (!Number.isSafeInteger(input.localOpSeq) || input.localOpSeq < 0) invalid()
@@ -945,6 +1719,9 @@ export class Coordinator {
       if (proposal.state !== 'pending_review' || proposal.base_revision !== document.revision) {
         throw new ProtocolError('REVISION_CONFLICT', 'This proposal needs a new review against the current document.')
       }
+      const docScope = this.documentScope(document)
+      this.assertVerifiedAudit(document.audit, 'document', docScope, document.creator_id)
+      this.assertVerifiedAudit(proposal.audit, 'proposal', { ...docScope, ...(proposal.workflow_id ? { workflowId: proposal.workflow_id } : {}) }, proposal.author_id)
       const source = this.row<Principal>('SELECT * FROM principals WHERE id=? AND active=1', proposal.author_id)
       if (!source) denied()
       this.authorize(source, 'proposal:create', this.documentScope(document))
@@ -1014,14 +1791,15 @@ export class Coordinator {
           if (proposal.state === 'pending_review' && proposal.base_revision === document.revision) {
             return { state: 'pending_review', reverseProposal: this.proposalView(proposal), document: current.document }
           }
-          throw new ProtocolError('REVISION_CONFLICT', 'The previous reverse proposal needs a new comparison against the current document.')
+          // An earlier reverse proposal went stale or was declined; the next one compares against the current text.
         }
         try {
           const after = this.snapshot(document, afterRef.revision)
           const operations = suggestReverseOperations(after, current, parse<TextChange[]>(undo.inverse_changes))
           const suggestion = this.createProposal(principal, current, operations, 'Reverse the earlier proposal while retaining later independent edits.',
             [{ uri: `urn:marktext:proposal:${undo.proposal_id}` }], document.workflow_id ?? undefined, 'recovery')
-          this.run('INSERT INTO reverse_proposals VALUES(?,?)', input.transactionId, suggestion.proposalId)
+          this.run('INSERT INTO reverse_proposals VALUES(?,?) ON CONFLICT(undo_id) DO UPDATE SET proposal_id=excluded.proposal_id',
+            input.transactionId, suggestion.proposalId)
           return { state: 'pending_review', reverseProposal: suggestion, document: current.document }
         } catch (error) {
           if (error instanceof ProtocolError && error.code === 'REVISION_CONFLICT') {
@@ -1039,6 +1817,16 @@ export class Coordinator {
       this.event(null, this.documentScope(document), 'proposal:read', 'proposal.undone', { transactionId: input.transactionId, document: snapshot.document })
       return { transactionId: randomUUID(), undoneTransactionId: input.transactionId, snapshot }
     })
+  }
+
+  /** The author's handle on the latest acceptance of a proposal that has not been undone. */
+  undoTransaction(auth: string, document: DocumentRef, proposalId: string) {
+    const principal = this.author(auth, 'proposal:approve', { workspaceId: document.workspaceId, docId: document.docId })
+    this.requireDocument(principal, document, 'proposal:approve')
+    const undo = this.row<{ id: string }>('SELECT id FROM undo_records WHERE doc_id=? AND proposal_id=? AND undone=0 ORDER BY rowid DESC LIMIT 1',
+      document.docId, proposalId)
+    if (!undo) throw new ProtocolError('REVISION_CONFLICT', 'This acceptance has already been undone, or the proposal was never accepted.')
+    return undo.id
   }
 
   beginSave(auth: string, input: AuthorInput & WriterToken & { document: DocumentRef; bindingId: string; unattended?: boolean }) {
@@ -1059,15 +1847,16 @@ export class Coordinator {
       const before = document.saved_revision !== null ? this.snapshot(document, document.saved_revision) : undefined
       const saveId = randomUUID()
       const taskId = randomUUID()
-      this.run('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,0,NULL,NULL,?,?)', taskId, principal.id, digest(auth), `${input.requestId}:file`,
+      this.run('INSERT INTO tasks(id,principal_id,credential_hash,request_id,request,scope,action,state,cancel_requested,result,error,created_at,updated_at,progress) VALUES(?,?,?,?,?,?,?,?,0,NULL,NULL,?,?,NULL)', saveId, principal.id, digest(auth), `${input.requestId}:file`,
         canonical({ capability: 'author.save', document: snapshot.document }), canonical(this.documentScope(document)), 'document:save', 'committing', this.now(), this.now())
+      this.run('UPDATE tasks SET id=? WHERE id=?', taskId, saveId)
       this.run('INSERT INTO save_outbox VALUES(?,?,?,?,?,?,?,?,?,NULL)', saveId, taskId, document.id, document.epoch,
         document.revision, input.bindingId, 'awaiting_file_port', before ? digest(before.rawText) : null, digest(snapshot.rawText))
       return { saveId, taskId, document: snapshot.document, binding, rawText: snapshot.rawText }
     })
   }
 
-  finishSave(auth: string, input: AuthorInput & WriterToken & { document: DocumentRef; saveId: string; observedRawText?: string; resourceVersion?: string; inPlace?: boolean; outcome: 'saved' | 'conflict' | 'unknown' | 'reauthorize' }) {
+  finishSave(auth: string, input: AuthorInput & WriterToken & { document: DocumentRef; saveId: string; observedRawText?: string; resourceVersion?: string; inPlace?: boolean; outcome: 'saved' | 'conflict' | 'unknown' | 'reauthorize' | 'cancelled' }) {
     return this.hostCommand(auth, 'save:finish', input, { workspaceId: input.document.workspaceId, docId: input.document.docId }, 'document:save', principal => {
       const document = this.requireDocument(principal, input.document, 'document:save')
       this.checkLease(principal, document, input)
@@ -1076,16 +1865,18 @@ export class Coordinator {
       if (save.state === 'succeeded' || save.state === 'failed') return parse<unknown>(save.result!)
       const observed = input.observedRawText === undefined ? undefined : digest(input.observedRawText)
       const succeeded = input.outcome === 'saved' && observed === save.after_digest
-      const code = succeeded ? undefined : input.outcome === 'reauthorize' ? 'RESOURCE_UNAVAILABLE'
-        : input.outcome === 'conflict' || (observed !== undefined && observed !== save.before_digest && observed !== save.after_digest)
-          ? 'SAVE_CONFLICT' : 'SAVE_OUTCOME_UNKNOWN'
-      const state = succeeded ? 'succeeded' : code === 'SAVE_CONFLICT' ? 'failed' : 'recovering'
+      const code = succeeded ? undefined : input.outcome === 'cancelled' ? 'SAVE_CANCELLED'
+        : input.outcome === 'reauthorize' ? 'RESOURCE_UNAVAILABLE'
+          : input.outcome === 'conflict' || (observed !== undefined && observed !== save.before_digest && observed !== save.after_digest)
+            ? 'SAVE_CONFLICT' : 'SAVE_OUTCOME_UNKNOWN'
+      const state = succeeded ? 'succeeded' : (code === 'SAVE_CONFLICT' || code === 'SAVE_CANCELLED') ? 'failed' : 'recovering'
+      const taskState = code === 'SAVE_CANCELLED' ? 'cancelled' : state
       const result = { saveId: save.id, taskId: save.task_id, state, saved: succeeded,
         document: { ...this.documentRef(document), revision: save.revision }, inPlace: !!input.inPlace,
         consistency: input.inPlace ? 'in-place' : 'file-port-reported', ...(code ? { code } : {}) }
       this.run('UPDATE save_outbox SET state=?,result=? WHERE id=?', state, canonical(result), save.id)
-      this.run('UPDATE tasks SET state=?,result=?,error=?,updated_at=? WHERE id=?', state, succeeded ? canonical(result) : null,
-        code ? canonical({ code, message: 'The external save needs verification or renewed authorization.', retryable: false }) : null,
+      this.run('UPDATE tasks SET state=?,result=?,error=?,updated_at=? WHERE id=?', taskState, succeeded ? canonical(result) : null,
+        code && code !== 'SAVE_CANCELLED' ? canonical({ code, message: 'The external save needs verification or renewed authorization.', retryable: false }) : null,
         this.now(), save.task_id)
       if (succeeded) {
         if (document.binding_id === save.binding_id) this.run('UPDATE documents SET saved_revision=? WHERE id=?', save.revision, document.id)
@@ -1119,7 +1910,7 @@ export class Coordinator {
       this.consumeApproval(input.ticket, binding, principal.id)
       const result = operation(principal)
       const taskId = randomUUID()
-      this.run('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,0,?,NULL,?,?)', taskId, principal.id, digest(auth), input.requestId,
+      this.run('INSERT INTO tasks(id,principal_id,credential_hash,request_id,request,scope,action,state,cancel_requested,result,error,created_at,updated_at,progress) VALUES(?,?,?,?,?,?,?,?,0,?,NULL,?,?,NULL)', taskId, principal.id, digest(auth), input.requestId,
         canonical({ capability: `author.${command}` }), canonical(scope), action, 'succeeded', canonical(result), this.now(), this.now())
       this.run('INSERT INTO idempotency_records VALUES(?,?,?,?,?)', principal.id, input.requestId, payloadDigest, taskId, canonical(result))
       this.event(principal.id, scope, action, `author.${command}`, { taskId })

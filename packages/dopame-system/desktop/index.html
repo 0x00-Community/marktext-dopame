@@ -3,25 +3,30 @@
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>MarkText 协作开发桌面</title>
+    <title>MarkText 协作服务</title>
     <style>
-      :root { color-scheme: light; font: 15px/1.6 system-ui, sans-serif; color: #28342e; background: #eef1ec; }
-      body { margin: 0; padding: 32px; }
-      main { max-width: 680px; }
-      h1 { font-size: 23px; }
-      button { padding: 8px 16px; font: inherit; border: 1px solid #85968a; border-radius: 4px; background: white; color: inherit; }
-      p { overflow-wrap: anywhere; }
+      :root { color-scheme: light dark; font: 15px/1.6 system-ui, sans-serif; color: #28342e; background: #eef1ec; }
+      @media (prefers-color-scheme: dark) { :root { color: #d7dbe1; background: #1e2127; } }
+      body { margin: 0; min-height: 100vh; }
+      button { padding: 8px 16px; font: inherit; border: 1px solid #85968a; border-radius: 4px; background: white; color: #28342e; cursor: pointer; }
+      #launcher { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; }
+      #launcher[hidden], #notice-area[hidden] { display: none; }
+      #notice-area { position: fixed; top: 16px; right: 16px; width: min(360px, calc(100vw - 32px)); }
+      #notifications { list-style: none; margin: 0; padding: 0; }
+      #notifications li { margin-bottom: 8px; padding: 10px 12px; border-radius: 6px; background: white; color: #28342e; box-shadow: 0 2px 10px #0003; overflow-wrap: anywhere; }
+      #notifications li button { margin: 6px 6px 0 0; padding: 4px 10px; }
+      [role=alert] { color: #a32835; }
     </style>
   </head>
   <body>
-    <main>
-      <h1>MarkText 协作开发桌面</h1>
-      <p>此桌面用于本机服务验证。系统 Agent 工具注册、可信批准、系统通知、文件交接和多窗口仍需目标环境验收。</p>
-      <p id="service-status" role="status">正在查询文档服务…</p>
-      <button id="refresh" type="button">刷新服务状态</button>
-      <button id="open" type="button">打开 MarkText 协作预览</button>
+    <!-- This desktop only hosts the document service: it opens MarkText and otherwise stays out of sight. -->
+    <section id="notice-area" aria-label="通知" hidden>
+      <ul id="notifications"></ul>
+    </section>
+    <div id="launcher" hidden>
+      <button id="open" type="button">打开 MarkText</button>
       <p id="open-error" role="alert" hidden></p>
-    </main>
+    </div>
     <script type="module" src="./src/main.ts"></script>
   </body>
 </html>

@@ -1,4 +1,5 @@
 import { fs } from 'acde:fs'
+import { formatImageMarkdown, isSupportedImageFileName, sanitizeAssetFileName } from './preferences'
 
 export { fs } from 'acde:fs'
 
@@ -16,11 +17,21 @@ const pickers = window as unknown as {
 // Keep the BOM in the editor's text so saving preserves it, like line endings.
 const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
 
+/** Other encodings are refused rather than guessed, so a later save cannot corrupt the file. */
+function decode(data: Parameters<TextDecoder['decode']>[0], name: string) {
+  try {
+    return decoder.decode(data)
+  } catch {
+    throw Object.assign(new Error(`无法打开「${name}」：文件不是 UTF-8 文本。此编辑器只支持 UTF-8（可带 BOM）的 Markdown 与纯文本，文件未被修改。`),
+      { code: 'EUNSUPPORTED_ENCODING' })
+  }
+}
+
 async function readHandle(handle: FileSystemFileHandle): Promise<OpenedFile> {
   const file = await handle.getFile()
   return {
     name: file.name,
-    text: decoder.decode(await file.arrayBuffer()),
+    text: decode(await file.arrayBuffer(), file.name),
     resource: { kind: 'handle', handle, modifiedMs: file.lastModified, size: file.size }
   }
 }
@@ -29,9 +40,10 @@ export async function readResource(resource: Resource): Promise<OpenedFile> {
   if (resource.kind === 'handle') return readHandle(resource.handle)
 
   const file = await fs.readBytes(resource.root, resource.path)
+  const name = resource.path.slice(resource.path.lastIndexOf('/') + 1)
   return {
-    name: resource.path.slice(resource.path.lastIndexOf('/') + 1),
-    text: decoder.decode(file.data),
+    name,
+    text: decode(file.data, name),
     resource: { ...resource, version: file.version }
   }
 }
@@ -166,4 +178,35 @@ export async function loadDocumentImage(resource: Resource | null, src: string) 
     document.body.append(image)
     image.src = url
   })
+}
+
+export async function pickAndImportImage(targetRoot: string, targetFolder = ''): Promise<{ name: string; relativePath: string; markdown: string }> {
+  const [handle] = await pickers.showOpenFilePicker({ multiple: false })
+  if (!handle) throw Object.assign(new Error('未选择图片文件'), { name: 'AbortError' })
+  const file = await handle.getFile()
+  if (!isSupportedImageFileName(file.name)) {
+    throw new Error(`不支持的图片格式「${file.name}」。请选择 PNG、JPG、GIF、WebP 或 SVG 图片。`)
+  }
+  const safeName = sanitizeAssetFileName(file.name)
+  const prefix = targetFolder ? `${targetFolder}/assets` : 'assets'
+  let assetName = safeName
+  let destPath = `${prefix}/${assetName}`
+  try {
+    await fs.stat(targetRoot, destPath)
+    const dot = safeName.lastIndexOf('.')
+    const stem = dot > 0 ? safeName.slice(0, dot) : safeName
+    const ext = dot > 0 ? safeName.slice(dot) : '.png'
+    assetName = `${stem}-${Date.now().toString(36)}${ext}`
+    destPath = `${prefix}/${assetName}`
+  } catch (error) {
+    if ((error as { code?: string }).code !== 'ENOENT') throw error
+  }
+  const bytes = new Uint8Array(await file.arrayBuffer())
+  await fs.writeFile(targetRoot, destPath, bytes, { mkdirs: true, create: 'new' })
+  const relativePath = `assets/${assetName}`
+  return {
+    name: assetName,
+    relativePath,
+    markdown: formatImageMarkdown(file.name, relativePath),
+  }
 }

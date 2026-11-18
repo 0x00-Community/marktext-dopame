@@ -1,5 +1,5 @@
 import { test, expect, type AppWindow } from 'acde/test'
-import { readFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 const sourceValue = `Array.from(document.querySelectorAll('.editor-panel'))
@@ -96,4 +96,43 @@ test('malformed version-one session remains untouched after editing and reload',
   await expect.poll(() => window.evaluate(`import('acde:fs').then(({fs}) => fs.readText('private', '.marktext/session.json')).then(f => f.text)`)).toBe(raw)
   await window.reload()
   await expect(window.getByRole('alert')).toContainText('原记录未覆盖')
+})
+
+test('preferences dialog updates editor font size, recent files reopen and clear, and image insertion imports into assets/', async({ app, acde, home }) => {
+  const window = app!
+  // 1. Preferences dialog
+  await window.getByRole('button', { name: '偏好设置', exact: true }).click()
+  const dialog = window.getByRole('dialog')
+  await expect(dialog).toBeVisible()
+  const fontInput = window.locator('#pref-font-size')
+  await fontInput.fill('20')
+  await window.getByRole('button', { name: '完成', exact: true }).click()
+  await expect(dialog).toHaveCount(0)
+  expect(await window.evaluate(`document.querySelector('.rich-editor').style.fontSize`)).toBe('20px')
+
+  // 2. Create note & verify recent files list in sidebar
+  await window.getByRole('button', { name: '新建笔记', exact: true }).click()
+  await window.locator('#file-name').fill('recent-note.md')
+  await window.getByRole('button', { name: '创建', exact: true }).click()
+  await expect(window.getByRole('tab', { name: 'recent-note.md', exact: true })).toBeVisible()
+  const recentNav = window.getByRole('navigation', { name: '最近文件', exact: true })
+  await expect(recentNav).toContainText('recent-note.md')
+
+  // Close the tab and reopen from recent files
+  await window.getByRole('button', { name: '关闭 recent-note.md', exact: true }).click()
+  await expect(window.getByRole('tab', { name: 'recent-note.md', exact: true })).toHaveCount(0)
+  await recentNav.getByRole('button').first().click()
+  await expect(window.getByRole('tab', { name: 'recent-note.md', exact: true })).toBeVisible()
+  await window.getByRole('button', { name: '清空', exact: true }).click()
+  await expect(recentNav).toHaveCount(0)
+
+  // 3. Insert local image into assets/ and insert Markdown snippet
+  await window.getByRole('button', { name: '源码', exact: true }).click()
+  const imgPath = join(home, 'diagram.png')
+  // Minimal 1x1 transparent PNG bytes
+  const pngBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=', 'base64')
+  await writeFile(imgPath, pngBytes)
+  await acde.chooseFiles([imgPath])
+  await window.getByRole('button', { name: '插入图片', exact: true }).click()
+  await expect.poll(() => window.evaluate(sourceValue)).toContain('![diagram](assets/diagram.png)')
 })

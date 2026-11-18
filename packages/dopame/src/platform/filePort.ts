@@ -7,4 +7,8 @@ export const filePort = {
     if (copy || !snapshot.resource) return saveAs(snapshot.name, snapshot.text)
     return { name: snapshot.name, resource: await saveResource(snapshot.resource, snapshot.text) }
   },
+  /** Writes a copy to a newly chosen file; the document keeps its own save target and dirty state. */
+  async exportCopy(snapshot: SaveSnapshot) {
+    return { name: (await saveAs(snapshot.name, snapshot.text)).name }
+  },
 }

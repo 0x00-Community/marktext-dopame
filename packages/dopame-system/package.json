@@ -13,6 +13,9 @@
     "test": "bun test test/*.test.mjs",
     "test:package": "bun scripts/verify-packages.ts",
     "test:preview": "bun scripts/test-preview-ui.ts",
+    "test:preview-data": "bun scripts/test-preview-data.ts",
+    "test:approval-host": "bun scripts/test-approval-host.ts",
+    "dev:collab": "bun scripts/dev-collab.ts",
     "test:e2e": "bun scripts/test-native.ts"
   },
   "dependencies": {

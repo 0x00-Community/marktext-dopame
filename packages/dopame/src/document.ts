@@ -1,7 +1,7 @@
 import type { Resource } from './files'
 import { Lexer } from 'marked'
 import { DocumentController } from './domain/documentController.ts'
-import { normalizeMarkdown } from './domain/collaboration.ts'
+import { normalizeMarkdown, type DocumentRef } from './domain/collaboration.ts'
 
 export const documentController = new DocumentController()
 
@@ -16,6 +16,8 @@ export interface DocumentTab {
   saving: boolean
   bom: boolean
   eol: '\n' | '\r\n'
+  /** Set while the collaboration service holds the canonical copy; never restored from a session. */
+  collab?: DocumentRef
 }
 
 export function createDocument(name: string, text = '', resource: Resource | null = null): DocumentTab {

@@ -38,3 +38,33 @@ export function parseSession(text: string): { version: 1; activeId: string; tabs
     throw new Error('无法读取草稿格式，原记录未覆盖')
   }
 }
+
+/**
+ * Per-window session namespace helper:
+ * Returns a stable windowSessionId per window (via sessionStorage) and an isolated session path
+ * when multi-window namespace isolation is active, while keeping `.marktext/session.json` for single-window fallback.
+ */
+export function resolveWindowSession(storage?: Pick<Storage, 'getItem' | 'setItem'>): {
+  windowSessionId: string
+  sessionPath: string
+  legacySessionPath: string
+} {
+  const key = 'marktext-window-session-id'
+  let windowSessionId = ''
+  try {
+    const existing = storage?.getItem(key)
+    if (existing && /^[A-Za-z0-9_.:-]{8,128}$/.test(existing)) {
+      windowSessionId = existing
+    } else {
+      windowSessionId = crypto.randomUUID()
+      storage?.setItem(key, windowSessionId)
+    }
+  } catch {
+    windowSessionId = crypto.randomUUID()
+  }
+  return {
+    windowSessionId,
+    sessionPath: `.marktext/sessions/${windowSessionId}.json`,
+    legacySessionPath: '.marktext/session.json',
+  }
+}

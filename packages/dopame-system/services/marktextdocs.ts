@@ -1,8 +1,8 @@
 import type { ServiceContext, ServiceFactory, ServiceProcess } from '@dopame/acde-api'
-import type { DocumentsService } from '../src/agentClient'
+import type { DocumentsService, DocumentsServiceMode } from '../src/agentClient'
 import {
   failure, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
-  transportError, type PublicMethod, type WorkerResponse
+  transportError, type WorkerResponse
 } from '../src/transport'
 
 interface PendingCall {
@@ -11,7 +11,7 @@ interface PendingCall {
   timer: ReturnType<typeof setTimeout>
 }
 
-class WorkerBridge {
+export class WorkerBridge {
   private worker?: ServiceProcess
   private pending = new Map<string, PendingCall>()
   private sequence = 0
@@ -23,7 +23,10 @@ class WorkerBridge {
   private resolveReady!: () => void
   private rejectReady!: (error: Error) => void
 
-  constructor(ctx: ServiceContext) {
+  private readonly mode: DocumentsServiceMode
+
+  constructor(ctx: ServiceContext, workerFile = 'state-worker.js', mode: DocumentsServiceMode = 'proposal-preview') {
+    this.mode = mode
     this.ready = new Promise((resolve, reject) => {
       this.resolveReady = resolve
       this.rejectReady = reject
@@ -40,7 +43,7 @@ class WorkerBridge {
       this.worker?.kill('SIGTERM')
     }, 10000)
     try {
-      this.worker = ctx.spawn([executable, `${ctx.package}/desktop/state-worker.js`, ctx.state], {
+      this.worker = ctx.spawn([executable, `${ctx.package}/desktop/${workerFile}`, ctx.state], {
         cwd: ctx.state,
         onLine: line => this.receive(line),
         onExit: () => this.unavailable('Document state worker is unavailable; restart the desktop service.')
@@ -54,7 +57,7 @@ class WorkerBridge {
     return {
       available: this.available,
       ...(!this.available ? { reason: this.reason } : {}),
-      mode: 'proposal-preview' as const
+      mode: this.mode
     }
   }
 
@@ -106,7 +109,7 @@ class WorkerBridge {
     }
   }
 
-  async call(method: PublicMethod, args: unknown[]) {
+  async call(method: string, args: unknown[]) {
     await this.ready
     const worker = this.worker
     if (!this.available || !worker) throw failure('RESOURCE_UNAVAILABLE', this.reason, true)
@@ -137,9 +140,8 @@ class WorkerBridge {
   }
 }
 
-const factory: ServiceFactory = ctx => {
-  const bridge = new WorkerBridge(ctx)
-  const api: DocumentsService = {
+export function documentsApi(bridge: WorkerBridge): DocumentsService {
+  return {
     status: async() => bridge.status(),
     describe: auth => bridge.call('describe', [auth]),
     invoke: (auth, request) => bridge.call('invoke', [auth, request]),
@@ -154,7 +156,11 @@ const factory: ServiceFactory = ctx => {
     requestPairing: input => bridge.call('requestPairing', [input]),
     claimPairing: (pairingId, claimSecret) => bridge.call('claimPairing', [pairingId, claimSecret])
   }
-  return { api: { marktextdocs: api }, close: () => bridge.close() }
+}
+
+const factory: ServiceFactory = ctx => {
+  const bridge = new WorkerBridge(ctx)
+  return { api: { marktextdocs: documentsApi(bridge) }, close: () => bridge.close() }
 }
 
 export default factory

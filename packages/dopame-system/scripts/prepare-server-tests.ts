@@ -88,7 +88,7 @@ await writePayload('README.md', [
   '# Test-only core acceptance bundle',
   '',
   'This directory is never an application, service, Agent adapter or approval host.',
-  'It carries 41 system tests, including undo recovery regressions, and 23 editor/domain tests. Fake ApprovalPort implementations exist only in these isolated tests and prove no production human approval or real Agent identity.',
+  'It carries the system tests, including undo recovery regressions, and the editor/domain tests; the runner prints the counts. Fake ApprovalPort implementations exist only in these isolated tests and prove no production human approval or real Agent identity.',
   '',
   'Run from this directory on the target with Bun 1.4.4:',
   '',

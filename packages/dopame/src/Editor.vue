@@ -9,10 +9,19 @@ import 'codemirror/mode/gfm/gfm'
 import 'codemirror/addon/search/searchcursor'
 import { shortcutHint } from './shortcuts'
 import { editorText, outline } from './document'
+import { createEditorPortTracker } from './editor/editorPort'
 import { loadDocumentImage, type Resource } from './files'
 import { attachNativeSelection } from './nativeSelection'
+import { DEFAULT_PREFERENCES, type EditorPreferences } from './preferences'
 
-const props = defineProps<{ text: string; resource: Resource | null; mode: 'edit' | 'source' | 'read'; active: boolean; blocked?: boolean }>()
+const props = defineProps<{
+  text: string
+  resource: Resource | null
+  mode: 'edit' | 'source' | 'read'
+  active: boolean
+  blocked?: boolean
+  preferences?: EditorPreferences
+}>()
 const emit = defineEmits<{ change: [text: string]; outline: [items: { lvl: number; content: string; slug: string }[]] }>()
 const richHost = ref<HTMLElement>()
 const sourceHost = ref<HTMLElement>()
@@ -22,19 +31,32 @@ let syncing = false
 let richText = ''
 let sourceText = ''
 let searchText = ''
-let composing = false
+const portTracker = createEditorPortTracker()
 let detachSelection: (() => void) | undefined
 
 function isInputBusy() {
-  return composing
+  return portTracker.isInputBusy()
 }
 
 function compositionStart() {
-  composing = true
+  portTracker.onCompositionStart()
 }
 
 function compositionEnd() {
-  composing = false
+  portTracker.onCompositionEnd()
+}
+
+function getPortState() {
+  return portTracker.getState()
+}
+
+function acknowledgeCommit(revision: string, seq?: number) {
+  portTracker.onCommitted(revision, seq)
+}
+
+async function flushCompletedInput() {
+  await portTracker.waitForCompositionSettle()
+  flush()
 }
 
 function protectInput(event: Event) {
@@ -60,6 +82,7 @@ function publish() {
   const text = props.mode === 'source' ? source.getValue() : muya.getMarkdown()
   if (props.mode === 'source') sourceText = text
   else richText = text
+  portTracker.onLocalEdit()
   emit('change', text)
   emit('outline', muya.getTOC())
 }
@@ -153,6 +176,28 @@ function replace(text: string, all: boolean) {
   })
 }
 
+/**
+ * Shows text committed elsewhere (an accepted proposal, an undo) as one undo step of its own, without
+ * reporting it back as an edit: the caller already holds that text.
+ */
+function applyExternal(text: string) {
+  const next = editorText(text)
+  syncing = true
+  try {
+    if (props.mode === 'source') {
+      if (source.getValue() !== next) {
+        source.operation(() => source.replaceRange(next, { line: 0, ch: 0 },
+          { line: source.lastLine(), ch: source.getLine(source.lastLine()).length }, 'collab'))
+      }
+      sourceText = next
+    } else {
+      muya.replaceContent(next)
+      richText = next
+      emit('outline', muya.getTOC())
+    }
+  } finally { syncing = false }
+}
+
 function reveal(slug: string, index: number) {
   if (props.blocked) return
   if (props.mode === 'source') {
@@ -167,28 +212,104 @@ function reveal(slug: string, index: number) {
   }
 }
 
+function insertSnippet(snippet: string) {
+  if (props.mode === 'read' || props.blocked || isInputBusy()) return
+  flush()
+  if (props.mode === 'source' && source) {
+    source.operation(() => {
+      source.replaceSelection(snippet)
+    })
+    source.focus()
+    return
+  }
+  const current = muya ? muya.getMarkdown() : editorText(props.text)
+  const separator = current.length && !current.endsWith('\n') ? '\n\n' : current.endsWith('\n\n') ? '' : current.length ? '\n' : ''
+  const next = `${current}${separator}${snippet}\n`
+  muya.replaceContent(next)
+  richText = next
+  portTracker.onLocalEdit()
+  emit('change', next)
+  emit('outline', muya.getTOC())
+}
+
+function findNthIndexOf(haystack: string, needle: string, n: number): number {
+  let idx = -1
+  for (let i = 0; i <= n; i++) {
+    idx = haystack.indexOf(needle, idx + 1)
+    if (idx < 0) return -1
+  }
+  return idx
+}
+
+function getSelectedRange(): { start: number; end: number; excerpt: string } {
+  flush()
+  const full = props.mode === 'source' && source ? source.getValue() : (muya ? muya.getMarkdown() : editorText(props.text))
+  if (props.mode === 'source' && source) {
+    const from = source.indexFromPos(source.getCursor('from'))
+    const to = source.indexFromPos(source.getCursor('to'))
+    if (to >= from) {
+      return { start: from, end: to, excerpt: full.slice(from, to) }
+    }
+  } else if (typeof window !== 'undefined') {
+    const sel = window.getSelection()
+    const domSelected = sel?.toString()?.trim()
+    if (domSelected) {
+      let precedingOccurrences = 0
+      if (richHost.value && sel?.rangeCount) {
+        const range = sel.getRangeAt(0)
+        const preRange = document.createRange()
+        preRange.selectNodeContents(richHost.value)
+        try {
+          preRange.setEnd(range.startContainer, range.startOffset)
+          const preText = preRange.toString()
+          let pos = -1
+          while ((pos = preText.indexOf(domSelected, pos + 1)) >= 0) precedingOccurrences++
+        } catch { /* selection outside richHost */ }
+      }
+      const nthIdx = findNthIndexOf(full, domSelected, precedingOccurrences)
+      const idx = nthIdx >= 0 ? nthIdx : full.indexOf(domSelected)
+      if (idx >= 0) return { start: idx, end: idx + domSelected.length, excerpt: domSelected }
+    }
+  }
+  return { start: 0, end: full.length, excerpt: full }
+}
+
+function applyPreferences() {
+  const prefs = props.preferences ?? DEFAULT_PREFERENCES
+  if (richHost.value) {
+    richHost.value.style.fontSize = `${prefs.fontSize}px`
+    richHost.value.style.lineHeight = String(prefs.lineHeight)
+  }
+  if (source) {
+    source.setOption('lineNumbers', prefs.lineNumbers)
+  }
+}
+
 onMounted(() => {
+  const prefs = props.preferences ?? DEFAULT_PREFERENCES
   richText = sourceText = editorText(props.text)
   const container = document.createElement('div')
   richHost.value!.appendChild(container)
-  muya = new Muya(container, { markdown: richText, fontSize: 17, lineHeight: 1.75,
+  muya = new Muya(container, { markdown: richText, fontSize: prefs.fontSize, lineHeight: prefs.lineHeight,
     loadImage: src => loadDocumentImage(props.resource, src),
-    spellcheckEnabled: false, disableHtml: true, autoPairMarkdownSyntax: true })
+    spellcheckEnabled: false, disableHtml: true, autoPairMarkdownSyntax: prefs.autoPairMarkdownSyntax })
   muya.locale(zhCN)
   muya.init({ focus: false })
   detachSelection = attachNativeSelection(muya)
   muya.domNode.setAttribute('aria-label', 'Markdown 编辑器')
-  source = CodeMirror(sourceHost.value!, { value: sourceText, mode: 'gfm', lineNumbers: true,
+  source = CodeMirror(sourceHost.value!, { value: sourceText, mode: 'gfm', lineNumbers: prefs.lineNumbers,
     lineWrapping: true, tabSize: 2, indentUnit: 2, inputStyle: 'textarea',
     extraKeys: { 'Ctrl-S': () => {}, 'Cmd-S': () => {} } })
   source.getInputField().setAttribute('aria-label', 'Markdown 源码')
   muya.on('json-change', publish)
   source.on('change', publish)
+  applyPreferences()
   emit('outline', muya.getTOC())
   void syncMode()
 })
 watch(() => props.mode, syncMode)
 watch(() => props.blocked, syncReadOnly, { flush: 'sync' })
+watch(() => props.preferences, applyPreferences, { deep: true })
 watch(() => props.resource, () => muya?.invalidateImageCache())
 watch(() => props.active, async active => {
   if (!active) return
@@ -196,7 +317,7 @@ watch(() => props.active, async active => {
   if (props.mode === 'source') { source.refresh(); if (props.active && !props.blocked) source.focus() }
 })
 onBeforeUnmount(() => { detachSelection?.(); muya?.destroy() })
-defineExpose({ flush, undo, redo, command, find, replace, reveal, isInputBusy })
+defineExpose({ flush, flushCompletedInput, getPortState, acknowledgeCommit, insertSnippet, getSelectedRange, undo, redo, command, find, replace, reveal, isInputBusy, applyExternal })
 </script>
 
 <template>
